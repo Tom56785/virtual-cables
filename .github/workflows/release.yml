@@ -1,0 +1,140 @@
+# Releases a new version from main. The version comes from the latest vX.Y.Z
+# tag, bumped by the chosen part or replaced by an exact version. It is
+# written into Cargo.toml on the runner only, so nothing is committed: the
+# release is a tag on the main commit that was built.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Part of the version to increase (ignored when a version is given)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version to release instead, for example 1.2.0 (optional)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # all tags, to find the latest version
+
+      - name: Choose the version
+        id: version
+        shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Releases are made from main, not $GITHUB_REF_NAME."
+            exit 1
+          fi
+
+          latest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          current=${latest#v}
+          current=${current:-0.0.0}
+
+          requested=$(printf '%s' "$REQUESTED" | tr -d '[:space:]')
+          if [ -n "$requested" ]; then
+            version=${requested#v}
+            if ! [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::'$requested' is not a version of the form MAJOR.MINOR.PATCH."
+              exit 1
+            fi
+          else
+            IFS=. read -r major minor patch <<< "$current"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+              *) echo "::error::Unknown bump '$BUMP'."; exit 1 ;;
+            esac
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "::error::Tag v$version already exists."
+            exit 1
+          fi
+          if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -n 1)" != "$version" ]; then
+            echo "::error::Version $version is lower than the latest release, $current."
+            exit 1
+          fi
+
+          echo "::notice::Releasing v$version (previous release: ${latest:-none})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+
+      - name: Set the version in Cargo.toml
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+          grep -q "^version = \"$VERSION\"$" Cargo.toml
+          # Records the new version in Cargo.lock without changing dependencies.
+          cargo update --workspace
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Check the executable
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          target/release/VirtualCables.exe --self-test
+          # The log is echoed to the console too, so look for the version line itself.
+          if ! target/release/VirtualCables.exe --version | grep -F "Virtual Cables $VERSION (" | grep -v '^[0-9]'; then
+            echo "::error::The executable does not report version $VERSION."
+            exit 1
+          fi
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $name = "virtualcables-v$env:VERSION-windows-x64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/VirtualCables.exe, README.md, LICENSE $name
+          Copy-Item LICENSES $name -Recurse
+          Compress-Archive $name "$name.zip"
+          "archive=$name.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Tag and publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          gh release create "v$VERSION" "$ARCHIVE" \
+            --target "$GITHUB_SHA" \
+            --title "Virtual Cables v$VERSION" \
+            --generate-notes
