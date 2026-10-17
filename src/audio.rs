@@ -29,9 +29,46 @@ struct RingState {
     correction_integral: f64,
     started: bool,
     primed: bool,
+    /// The reserve the reader keeps. It grows when stalls repeat, and steps
+    /// back toward the configured reserve once the stream has been stable.
+    reserve_frames: usize,
+    /// Frames the reader has produced since it was first primed, silence
+    /// included: the clock for stall timing.
+    clock: u64,
+    /// Silent frames produced in the current outage, until audio arrives again.
+    outage: Option<u64>,
+    last_stall: Option<u64>,
+    settled_since: u64,
+    stalls: u64,
+    overruns: u64,
+}
+
+/// A snapshot of the ring's health, for the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingStatus {
+    pub buffered_frames: usize,
+    /// The reserve the reader keeps, in frames; 0 before its first read.
+    pub reserve_frames: usize,
+    pub correction_ppm: i64,
+    /// Underruns the reader recovered from: stalls, not the source stopping.
+    pub underruns: u64,
+    /// Writes that discarded unread audio because the ring was full.
+    pub overruns: u64,
 }
 
 const CLICK_FADE_FRAMES: usize = 48;
+
+/// An outage up to this long is a stall; a longer one is the source stopping,
+/// which says nothing about whether the reserve is large enough.
+const MAX_STALL_FRAMES: u64 = 48000;
+
+/// Two stalls this close together mean the reserve is too small for the
+/// current system load, rather than a one-off hiccup.
+const REPEAT_STALL_FRAMES: u64 = 10 * 48000;
+
+/// After this long without a stall, a grown reserve steps back toward the
+/// configured one.
+const RELAX_FRAMES: u64 = 120 * 48000;
 
 impl Ring {
     /// Creates a byte-oriented ring, for callers that do not carry framed audio.
@@ -66,6 +103,13 @@ impl Ring {
                 correction_integral: 0.0,
                 started: false,
                 primed: false,
+                reserve_frames: 0,
+                clock: 0,
+                outage: None,
+                last_stall: None,
+                settled_since: 0,
+                stalls: 0,
+                overruns: 0,
             }),
         }
     }
@@ -92,6 +136,17 @@ impl Ring {
         (self.lock().correction * 1_000_000.0).round() as i64
     }
 
+    pub fn status(&self) -> RingStatus {
+        let r = self.lock();
+        RingStatus {
+            buffered_frames: r.size / self.frame_size,
+            reserve_frames: r.reserve_frames,
+            correction_ppm: (r.correction * 1_000_000.0).round() as i64,
+            underruns: r.stalls,
+            overruns: r.overruns,
+        }
+    }
+
     /// Keeps the newest complete frames. If the ring is full, old data is
     /// discarded in whole frames; dropping individual bytes corrupts 24-bit PCM
     /// sample/channel alignment and can cause audible crackling.
@@ -106,6 +161,7 @@ impl Ring {
             r.dropped += (p.len() - complete_len) as u64;
         }
         let mut p = &p[..complete_len];
+        let mut overran = false;
         if p.is_empty() {
             if discontinuity {
                 r.needs_fade = true;
@@ -120,6 +176,7 @@ impl Ring {
             p = &p[discard..];
             r.dropped += discard as u64;
             discontinuity = true;
+            overran = true;
         }
 
         // Make room in complete frames, keeping both read position and buffer
@@ -129,6 +186,11 @@ impl Ring {
             r.size -= frame_size;
             r.dropped += frame_size as u64;
             discontinuity = true;
+            overran = true;
+        }
+        // A ring nobody reads yet fills up as a matter of course.
+        if overran && r.primed {
+            r.overruns += 1;
         }
 
         for &b in p {
@@ -155,7 +217,8 @@ impl Ring {
 
     /// Reads stereo packed 24-bit PCM from an elastic buffer. Occupancy
     /// feedback tracks clock drift without reacting sharply to packet jitter.
-    /// Both startup and recovery wait for the full `target_frames` reserve.
+    /// Both startup and recovery wait for the full reserve: `target_frames`,
+    /// grown for as long as repeated stalls keep emptying the ring.
     pub fn read_adaptive_pcm24(&self, p: &mut [u8], target_frames: usize) -> usize {
         const FRAME_SIZE: usize = 6;
         const FADE_FRAMES: usize = CLICK_FADE_FRAMES;
@@ -173,19 +236,30 @@ impl Ring {
         }
 
         let capacity = r.buf.len();
-        let capacity_frames = capacity / FRAME_SIZE;
-        let mut target_frames = target_frames.max(2);
-        if target_frames > capacity_frames / 2 {
-            target_frames = (capacity_frames / 2).max(2);
-        }
+        let max_target_frames = (capacity / FRAME_SIZE / 2).max(2);
+        let base_frames = target_frames.clamp(2, max_target_frames);
+        r.reserve_frames = r.reserve_frames.clamp(base_frames, max_target_frames);
+        let frames = (complete_len / FRAME_SIZE) as u64;
 
         let mut available_frames = r.size / FRAME_SIZE;
         if !r.started {
-            if available_frames < target_frames {
+            // Audio is arriving again. If the outage was a stall rather than
+            // the source stopping, grow the reserve before refilling it.
+            if available_frames > 0
+                && let Some(silence) = r.outage.take()
+                && silence <= MAX_STALL_FRAMES
+            {
+                r.note_stall(max_target_frames);
+            }
+            if available_frames < r.reserve_frames {
                 p[..complete_len].fill(0);
                 if r.primed {
                     // Count recovery silence as well as frames lost after the ring empties.
                     r.underruns += complete_len as u64;
+                    if let Some(silence) = &mut r.outage {
+                        *silence += frames;
+                    }
+                    r.tick(frames, base_frames);
                 }
                 return 0;
             }
@@ -208,7 +282,8 @@ impl Ring {
             let dt = frames / 48000.0;
             let fill_alpha = 1.0 - (-dt / 0.5).exp();
             r.filtered_fill += (available_frames as f64 - r.filtered_fill) * fill_alpha;
-            let error_ratio = (r.filtered_fill - target_frames as f64) / target_frames as f64;
+            let target_frames = r.reserve_frames as f64;
+            let error_ratio = (r.filtered_fill - target_frames) / target_frames;
             const PROPORTIONAL_GAIN: f64 = 0.01;
             const INTEGRAL_GAIN: f64 = 0.0005;
             const MAX_RATE_CORRECTION: f64 = 0.005;
@@ -244,6 +319,10 @@ impl Ring {
                 if !r.underrun {
                     r.underrun = true;
                     r.fade_out = FADE_FRAMES;
+                    r.outage = Some(0);
+                }
+                if let Some(silence) = &mut r.outage {
+                    *silence += 1;
                 }
                 let mut gain = 0.0;
                 if r.fade_out > 0 {
@@ -314,9 +393,12 @@ impl Ring {
         if complete_len < p.len() {
             r.underruns += (p.len() - complete_len) as u64;
         }
+        r.tick(frames, base_frames);
         consumed
     }
 
+    /// Clears the stream. The reserve grown by repeated stalls is kept: it
+    /// reflects the system's load rather than this stream.
     pub fn reset(&self) {
         let mut r = self.lock();
         r.read = 0;
@@ -334,6 +416,32 @@ impl Ring {
         r.correction_integral = 0.0;
         r.started = false;
         r.primed = false;
+        r.outage = None;
+        r.last_stall = None;
+    }
+}
+
+impl RingState {
+    /// Records a stall the reader recovered from. A second stall within
+    /// `REPEAT_STALL_FRAMES` grows the reserve by half, up to `max_frames`.
+    fn note_stall(&mut self, max_frames: usize) {
+        self.stalls += 1;
+        if self.last_stall.is_some_and(|at| self.clock - at <= REPEAT_STALL_FRAMES) {
+            self.reserve_frames = (self.reserve_frames + self.reserve_frames / 2).min(max_frames);
+        }
+        self.last_stall = Some(self.clock);
+        self.settled_since = self.clock;
+    }
+
+    /// Advances the stall clock by `frames` the reader produced. Each
+    /// `RELAX_FRAMES` without a stall undoes one growth step, down to
+    /// `base_frames`; the rate controller then drains the excess gently.
+    fn tick(&mut self, frames: u64, base_frames: usize) {
+        self.clock += frames;
+        if self.reserve_frames > base_frames && self.clock - self.settled_since >= RELAX_FRAMES {
+            self.reserve_frames = (self.reserve_frames * 2 / 3).max(base_frames);
+            self.settled_since = self.clock;
+        }
     }
 }
 
@@ -396,9 +504,80 @@ mod tests {
             r.read_adaptive_pcm24(&mut out, TARGET);
         }
         assert_ne!(r.correction_ppm(), 0, "controller did not respond to the shortfall");
-        r.write(&vec![0; TARGET * 6]);
+        // The repeated stalls have also grown the reserve.
+        r.write(&vec![0; r.status().reserve_frames * 6]);
         r.read_adaptive_pcm24(&mut out, TARGET);
         assert_eq!(r.correction_ppm(), 0, "correction after recovery");
+    }
+
+    /// Streams `ms` milliseconds in real time, 1 ms per packet, with the
+    /// writer skipping the packets where `gap` holds.
+    fn stream(r: &Ring, target: usize, ms: usize, gap: impl Fn(usize) -> bool) {
+        let mut out = vec![0; 48 * 6];
+        for i in 0..ms {
+            if !gap(i) {
+                r.write(&[0; 48 * 6]);
+            }
+            r.read_adaptive_pcm24(&mut out, target);
+        }
+    }
+
+    #[test]
+    fn repeated_stalls_grow_reserve() {
+        const TARGET: usize = 480; // 10 ms
+        let r = Ring::new_framed(48000 * 6, 6);
+        stream(&r, TARGET, 1000, |_| false);
+        assert_eq!(r.status().underruns, 0, "underran while streaming in real time");
+
+        // A one-off stall is recovered at the configured reserve.
+        stream(&r, TARGET, 2000, |i| i < 30);
+        assert_eq!((r.status().underruns, r.status().reserve_frames), (1, TARGET));
+
+        // A second one within a few seconds grows the reserve, and the ring refills to it.
+        stream(&r, TARGET, 2000, |i| i < 30);
+        let status = r.status();
+        assert_eq!((status.underruns, status.reserve_frames), (2, TARGET * 3 / 2));
+        assert!(status.buffered_frames.abs_diff(TARGET * 3 / 2) <= 48, "buffered {} frames", status.buffered_frames);
+
+        // The grown reserve now absorbs the same stall.
+        stream(&r, TARGET, 2000, |i| i < 12);
+        assert_eq!(r.status().underruns, 2);
+    }
+
+    #[test]
+    fn stable_stream_relaxes_reserve() {
+        const TARGET: usize = 480;
+        let r = Ring::new_framed(48000 * 6, 6);
+        stream(&r, TARGET, 1000, |_| false);
+        stream(&r, TARGET, 1000, |i| i < 30);
+        stream(&r, TARGET, 1000, |i| i < 30);
+        assert_eq!(r.status().reserve_frames, 720);
+        stream(&r, TARGET, 119_000, |_| false);
+        assert_eq!(r.status().reserve_frames, 720, "relaxed early");
+        stream(&r, TARGET, 2000, |_| false);
+        assert_eq!(r.status().reserve_frames, TARGET);
+    }
+
+    #[test]
+    fn source_stopping_is_not_a_stall() {
+        const TARGET: usize = 480;
+        let r = Ring::new_framed(48000 * 6, 6);
+        stream(&r, TARGET, 1000, |_| false);
+        // A paused source: playback stops for longer than any stall.
+        stream(&r, TARGET, 3000, |i| i < 1500);
+        stream(&r, TARGET, 3000, |i| i < 1500);
+        let status = r.status();
+        assert_eq!((status.underruns, status.reserve_frames), (0, TARGET));
+    }
+
+    #[test]
+    fn overruns_count_only_while_read() {
+        let r = Ring::new_framed(48 * 6 * 20, 6); // 20 ms
+        r.write(&[0; 48 * 6 * 30]);
+        assert_eq!(r.status().overruns, 0, "nothing reads the ring yet");
+        stream(&r, 240, 10, |_| false);
+        r.write(&[0; 48 * 6 * 30]);
+        assert_eq!(r.status().overruns, 1);
     }
 
     #[test]

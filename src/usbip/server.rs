@@ -358,7 +358,7 @@ impl Server {
                         Ok(body) => u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
                         Err(_) => break,
                     };
-                    let (found, result) = state.unlink(&basic, target, current_bus_time());
+                    let (found, result) = state.unlink(&basic, target);
                     // Windows unlinks every queued URB on a pipe abort. Logging each
                     // one synchronously on this reader loop delays following SUBMITs.
                     if self.diagnostics {
@@ -414,7 +414,7 @@ impl Server {
                 if is_endpoint_halt_clear(&setup) {
                     self.trace_endpoint_halt(device, state, &setup, now);
                 }
-                reset_timelines_after_control(state, &setup, now);
+                reset_timelines_after_control(state, &setup);
             }
             data.truncate(req.transfer_buffer_length as usize);
             let mut actual = data.len() as u32;
@@ -468,6 +468,7 @@ impl Server {
                 submit.input.resize(length, 0);
                 if device.capture_active() {
                     device.read_capture(&mut submit.input);
+                    self.report_audio_health(state, device);
                 } else {
                     submit.input.fill(0); // digital silence; the reused buffer holds old audio
                 }
@@ -500,6 +501,55 @@ impl Server {
             "{} HALT CLEAR #{count} ep={endpoint} in_flight={pending} scheduled={scheduled} next_lead_frames={next_lead} since_previous_us={}",
             device.bus_id,
             (now_nanos - previous) / 1000
+        );
+    }
+
+    /// Logs a cable's audio health when it has changed: underruns and
+    /// overruns, the reserve the ring has grown to, and the schedule restarts
+    /// and pipe resets that usually cause them. Unlike the traces, it is always
+    /// on, so the log of a session that went wrong shows why; it adds at most
+    /// one line per `HEALTH_REPORT_INTERVAL`. The first look only records a
+    /// baseline.
+    pub(crate) fn report_audio_health(&self, state: &ConnState, device: &Device) {
+        let now = Instant::now();
+        let mut report = lock(&state.health);
+        if report.next_check.is_some_and(|at| now < at) {
+            return;
+        }
+        report.next_check = Some(now + HEALTH_REPORT_INTERVAL);
+        let ring = device.buffer.status();
+        let health = {
+            let s = lock(&state.sched);
+            Health {
+                underruns: ring.underruns,
+                overruns: ring.overruns,
+                reserve_frames: ring.reserve_frames,
+                playback_resyncs: s.iso_resyncs.get(&1).copied().unwrap_or(0),
+                capture_resyncs: s.iso_resyncs.get(&2).copied().unwrap_or(0),
+                halt_clears: s.halt_clears,
+            }
+        };
+        let Some(previous) = report.reported.replace(health) else {
+            return;
+        };
+        if health == previous {
+            return;
+        }
+        logf!(
+            self.logger,
+            "{} AUDIO HEALTH underruns={} (+{}) overruns={} (+{}) reserve_ms={} configured_reserve_ms={} queue_ms={} rate_correction_ppm={} playback_resyncs={} capture_resyncs={} halt_clears={}",
+            device.bus_id,
+            health.underruns,
+            health.underruns - previous.underruns,
+            health.overruns,
+            health.overruns - previous.overruns,
+            health.reserve_frames / 48,
+            device.reserve_frames() / 48,
+            ring.buffered_frames / 48,
+            ring.correction_ppm,
+            health.playback_resyncs,
+            health.capture_resyncs,
+            health.halt_clears
         );
     }
 
@@ -611,6 +661,28 @@ pub(crate) struct ConnState {
     writer: Mutex<WriterState>,
     sched: Mutex<Schedule>,
     pub(crate) pool: UrbPool,
+    health: Mutex<HealthReport>,
+}
+
+/// How often the audio health report may add a line to the log.
+const HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The audio health report's state: when it may next look, and what it last
+/// reported.
+#[derive(Default)]
+struct HealthReport {
+    next_check: Option<Instant>,
+    reported: Option<Health>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Health {
+    underruns: u64,
+    overruns: u64,
+    reserve_frames: usize,
+    playback_resyncs: u64,
+    capture_resyncs: u64,
+    halt_clears: u64,
 }
 
 struct WriterState {
@@ -624,20 +696,11 @@ struct Schedule {
     pending: HashMap<u32, PendingUrb>,
     iso_pending: HashMap<u32, i64>,
     iso_next: HashMap<u32, u64>,
+    /// Schedule restarts by endpoint, and endpoint halt clears, for the audio
+    /// health report.
+    iso_resyncs: HashMap<u32, u64>,
+    halt_clears: u64,
 }
-
-/// How far the schedule of a reset pipe may have fallen behind the bus clock
-/// and still be continued. A host that resubmits within this window is still
-/// streaming; beyond it the stream is restarted.
-const MAX_ISO_RESET_LAG_FRAMES: u64 = 16;
-
-/// Matches the Windows USB stack: for ASAP transfers it keeps each URB
-/// contiguous with the previous one, however late, and only resets its
-/// start-frame tracking after 1024 frames without a URB. Within this window a
-/// late URB keeps its frames and completes immediately, so the host catches up
-/// without the reported stream position jumping. usbaudio never sees such a
-/// jump from real hardware.
-const MAX_ISO_LATE_FRAMES: u64 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IsoSlot {
@@ -646,61 +709,41 @@ pub(crate) struct IsoSlot {
     /// reaches it.
     pub end_frame: u64,
     pub deadline: Option<Instant>,
-    /// The schedule had fallen too far behind and was restarted at the next
-    /// bus frame.
+    /// The URB arrived after its slot in a running stream had passed, and was
+    /// moved to the next bus frame.
     pub resynced: bool,
 }
 
 impl Schedule {
     /// Discards the completion schedule of an idle endpoint, so its next URB
-    /// starts a new stream. Used when the stream is stopped by SET_INTERFACE or
-    /// SET_CONFIGURATION.
+    /// starts a new stream on the next bus frame. Used when the host stops the
+    /// stream (SET_INTERFACE or SET_CONFIGURATION), aborts it (an UNLINK of
+    /// every queued URB) or resets the pipe (CLEAR_FEATURE(ENDPOINT_HALT)).
+    ///
+    /// For a reset, this is what the Windows USB stack documents for ASAP
+    /// transfers: the first transfer after the pipe "was opened or last reset"
+    /// begins on the next frame. Carrying on the old schedule instead reports
+    /// the first URB after a reset as having started before it was submitted,
+    /// which can keep usbaudio resetting the pipe after every URB. For an
+    /// abort, it also discards the future slots of the unlinked URBs, which
+    /// would otherwise push all later completions further into the future.
     fn reset_iso_timeline(&mut self, endpoint: u32) {
         if self.iso_pending.get(&endpoint).copied().unwrap_or(0) == 0 {
             self.iso_next.remove(&endpoint);
         }
     }
 
-    /// Handles a pipe reset (an abort that unlinks queued URBs, or
-    /// CLEAR_FEATURE(ENDPOINT_HALT)) on an idle endpoint.
-    ///
-    /// Unlinked URBs complete immediately but their reserved slots remain on
-    /// the timeline. Those future slots are discarded: otherwise every pipe
-    /// abort pushes all later completions further into the future, so the host
-    /// streams less than real time and the opposite endpoint gradually drains
-    /// the ring.
-    ///
-    /// A schedule that has just ended is kept, though. After a stall, usbaudio
-    /// can fall into resetting the pipe after every URB, with a single URB in
-    /// flight. Restarting each URB on the next bus frame then adds the reset's
-    /// round trip to every 10 ms URB, and playback runs ~20% slower than real
-    /// time, permanently underrunning capture. Continuing the schedule absorbs
-    /// that round trip, so the stream still advances one frame per frame.
-    fn rewind_iso_timeline(&mut self, endpoint: u32, current: u64) {
-        if self.iso_pending.get(&endpoint).copied().unwrap_or(0) != 0 {
-            return;
-        }
-        let Some(&next) = self.iso_next.get(&endpoint) else {
-            return;
-        };
-        if next > current + 1 {
-            self.iso_next.insert(endpoint, current + 1);
-        } else if next + MAX_ISO_RESET_LAG_FRAMES < current + 1 {
-            self.iso_next.remove(&endpoint);
-        }
-    }
-
     /// Removes a pending URB so that exactly one reply is sent for it. When
     /// unlinked, the URB is also cancelled, and an endpoint left idle by the
-    /// unlink has its completion timeline rewound.
-    fn claim_pending(&mut self, sequence: u32, unlinked: bool, current_frame: u64) -> bool {
+    /// unlink starts a new stream with its next URB.
+    fn claim_pending(&mut self, sequence: u32, unlinked: bool) -> bool {
         let Some(entry) = self.pending.remove(&sequence) else {
             return false;
         };
         *self.iso_pending.entry(entry.endpoint).or_default() -= 1;
         if unlinked {
             entry.cancel.cancel();
-            self.rewind_iso_timeline(entry.endpoint, current_frame);
+            self.reset_iso_timeline(entry.endpoint);
         }
         true
     }
@@ -712,6 +755,7 @@ impl ConnState {
             writer: Mutex::new(WriterState { out, frame: Vec::new() }),
             sched: Mutex::new(Schedule::default()),
             pool: UrbPool::default(),
+            health: Mutex::new(HealthReport::default()),
         }
     }
 
@@ -723,8 +767,11 @@ impl ConnState {
         }
     }
 
-    pub(crate) fn rewind_iso_timeline(&self, endpoint: u32, now: BusTime) {
-        lock(&self.sched).rewind_iso_timeline(endpoint, now.frame());
+    /// Handles CLEAR_FEATURE(ENDPOINT_HALT): the host has reset the pipe.
+    pub(crate) fn clear_endpoint_halt(&self, endpoint: u32) {
+        let mut s = lock(&self.sched);
+        s.halt_clears += 1;
+        s.reset_iso_timeline(endpoint);
     }
 
     /// Reports how many URBs are pending on an endpoint and how far its next
@@ -745,6 +792,13 @@ impl ConnState {
     /// schedule (not the arrival time) sets the cadence. Because the schedule is
     /// on the host's bus clock, completions never drift against the frame
     /// numbers Windows uses to track the stream.
+    ///
+    /// A URB never starts on a frame that has already begun: if its slot has
+    /// passed, it starts on the next bus frame, as Linux host controllers do
+    /// for URB_ISO_ASAP ("the first unexpired slot, breaking the queue's
+    /// synchronization"). Reporting a start frame in the past is something no
+    /// real host controller does. If no other URB is queued, the stream had
+    /// simply ended, and the URB starts a new one.
     pub(crate) fn reserve_iso_completion(&self, endpoint: u32, packets: u32, now: BusTime) -> IsoSlot {
         if packets == 0 {
             return IsoSlot {
@@ -760,12 +814,15 @@ impl ConnState {
         let current = now.frame();
         let mut resynced = false;
         let start = match s.iso_next.get(&endpoint) {
-            Some(&next) if next + MAX_ISO_LATE_FRAMES >= current => next,
+            Some(&next) if next > current => next,
             scheduled => {
-                resynced = scheduled.is_some();
+                resynced = scheduled.is_some() && s.iso_pending.get(&endpoint).copied().unwrap_or(0) > 0;
                 current + 1
             }
         };
+        if resynced {
+            *s.iso_resyncs.entry(endpoint).or_default() += 1;
+        }
         let end = start + packets as u64;
         s.iso_next.insert(endpoint, end);
         IsoSlot { start_frame: start as u32, end_frame: end, deadline: Some(now.frame_start(end)), resynced }
@@ -786,7 +843,7 @@ impl ConnState {
         error_count: u32,
     ) -> io::Result<()> {
         let mut w = lock(&self.writer);
-        if submit.tracked && !lock(&self.sched).claim_pending(submit.req.basic.sequence, false, 0) {
+        if submit.tracked && !lock(&self.sched).claim_pending(submit.req.basic.sequence, false) {
             return Ok(());
         }
         let w = &mut *w;
@@ -797,9 +854,9 @@ impl ConnState {
 
     /// Claims a pending URB, cancels it and replies with RET_UNLINK. Reports
     /// whether the URB was still pending, and the result of the reply write.
-    pub(crate) fn unlink(&self, req: &BasicHeader, target: u32, now: BusTime) -> (bool, io::Result<()>) {
+    pub(crate) fn unlink(&self, req: &BasicHeader, target: u32) -> (bool, io::Result<()>) {
         let mut w = lock(&self.writer);
-        let found = lock(&self.sched).claim_pending(target, true, now.frame());
+        let found = lock(&self.sched).claim_pending(target, true);
         // The protocol specifies -ECONNRESET for a successful unlink.
         let status = if found { STATUS_CONN_RESET } else { STATUS_OK };
         let w = &mut *w;
@@ -1037,12 +1094,13 @@ const HALT_BURST_LINES: u64 = 30;
 
 /// Updates the completion schedule of endpoints the host has reset. Windows
 /// aborts a pipe (unlinking its URBs) and then clears ENDPOINT_HALT before
-/// streaming again; the new stream must not wait for the slots of the
-/// discarded URBs. Selecting an interface or configuration stops the stream,
-/// so its next URB starts a new schedule.
-pub(crate) fn reset_timelines_after_control(state: &ConnState, setup: &SetupPacket, now: BusTime) {
+/// streaming again; the new stream starts on the next bus frame, neither
+/// waiting for the slots of the discarded URBs nor continuing the old schedule.
+/// Selecting an interface or configuration stops the stream, so its next URB
+/// starts a new schedule.
+pub(crate) fn reset_timelines_after_control(state: &ConnState, setup: &SetupPacket) {
     if is_endpoint_halt_clear(setup) {
-        state.rewind_iso_timeline((setup.index & 0x0f) as u32, now);
+        state.clear_endpoint_halt((setup.index & 0x0f) as u32);
     } else if (setup.request_type == 0x01 && setup.request == uac1::REQUEST_SET_INTERFACE)
         || (setup.request_type == 0x00 && setup.request == uac1::REQUEST_SET_CONFIGURATION)
     {

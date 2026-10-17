@@ -77,7 +77,7 @@ name = "Game audio"
 |---|---|---|
 | `listen` | Address of the local USB/IP server. | `"127.0.0.1:3240"` |
 | `buffer_ms` | Ring-buffer capacity per cable, 20-2000 ms. Only matters when audio backs up, for example after a system stall. | `250` |
-| `reserve_ms` | Audio kept buffered against scheduling hiccups, from 10 ms to half of `buffer_ms`. This is the latency a cable adds: lower is more responsive, higher is more tolerant of system load. | `40` |
+| `reserve_ms` | Audio kept buffered against scheduling hiccups, from 10 ms to half of `buffer_ms`. This is the latency a cable adds: lower is more responsive, higher is more tolerant of system load. If the recording side runs out of audio twice within 10 seconds, the cable grows its reserve by half, up to half of `buffer_ms`, and steps it back after every 2 minutes without a dropout. | `40` |
 | `diagnostics` | Detailed USB/IP traces in the log, for troubleshooting (`true` or `false`). | `false` |
 | `[[cable]]` | One table per cable, up to 32, in list order. `serial` is created with the cable and is its identity in Windows, so a new cable is always a new device there with its own name, and an existing one keeps its settings after a restart. `id` (1-255) sets the USB product ID (`FFFF:CAxx`) and bus ID (`1-<id>`). `name` is what Windows Sound shows. The application rewrites these tables when cables are added or removed, and removing a cable also deletes its devices from Windows. | none |
 
@@ -104,7 +104,7 @@ The executable is a windowed application, so to see command-line output in a con
 
 The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at each start of the application, so it holds only the current session; check it before restarting after a problem.
 
-- **Crackling or dropouts:** set `diagnostics = true`, restart, and reproduce the problem. Lines containing `underrun_bytes` that keep increasing mean the recording side is running out of audio; `HALT CLEAR` lines show Windows resetting a stream after a system stall. If dropouts happen during normal load, try a larger `reserve_ms`.
+- **Crackling or dropouts:** look for `AUDIO HEALTH` lines. They are always logged, at most one every 10 seconds per cable, when something has changed: `underruns` (the recording side ran out of audio), `overruns` (the buffer was full and audio was discarded), `reserve_ms` (the reserve the cable has grown to), and `playback_resyncs`, `capture_resyncs` and `halt_clears` (stream restarts and resets by Windows). Underruns that keep rising while `reserve_ms` stays at its maximum mean the playback side is delivering less than real time, which a larger buffer cannot fix. For more detail, set `diagnostics = true`, restart, and reproduce the problem. Lines containing `underrun_bytes` that keep increasing mean the recording side is running out of audio; `HALT CLEAR` lines show Windows resetting a stream after a system stall. If dropouts happen during normal load, try a larger `reserve_ms`.
 - **No devices in Windows Sound:** check that usbip-win2 is installed and that the administrator prompt was approved. The `usbip.exe` lines in the log show the attach steps and any errors.
 
 ## Building from source
