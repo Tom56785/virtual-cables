@@ -120,6 +120,10 @@ impl<R: Read> ConnReader<R> {
         ConnReader { inner, buf: vec![0; capacity].into_boxed_slice(), pos: 0, end: 0 }
     }
 
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
     /// Returns the next `n` bytes, valid until the next read. A stream that
     /// ends before any of them is `UnexpectedEof` with no bytes consumed
     /// (`is_clean_eof`); one that ends part-way is a plain `UnexpectedEof`.

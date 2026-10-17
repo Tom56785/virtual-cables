@@ -187,11 +187,13 @@ impl Server {
 
     fn serve_connection(self: &Arc<Self>, id: u64, conn: &TcpStream) {
         let remote = conn.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
-        let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = conn.set_write_timeout(Some(Duration::from_secs(30)));
         let (Ok(read_half), Ok(mut write_half)) = (conn.try_clone(), conn.try_clone()) else {
             return;
         };
+        // On Windows each clone is a duplicated socket with its own copy of the
+        // timeouts, so they are set and cleared on the halves actually used.
+        let _ = read_half.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = write_half.set_write_timeout(Some(Duration::from_secs(30)));
         let mut reader = ConnReader::new(read_half, 64 * 1024);
         let header = match read_op_header(&mut reader) {
             Ok(header) => header,
@@ -228,8 +230,9 @@ impl Server {
                 if write_half.write_all(&reply).is_err() {
                     return;
                 }
-                let _ = conn.set_read_timeout(None);
-                let _ = conn.set_write_timeout(None);
+                // An idle audio device sends no URBs, so the session must not time out.
+                let _ = reader.get_ref().set_read_timeout(None);
+                let _ = write_half.set_write_timeout(None);
                 logf!(self.logger, "import accepted: {} ({}), client {remote}", device.bus_id, device.product());
                 self.handle_urbs(reader, Box::new(write_half), device);
             }
