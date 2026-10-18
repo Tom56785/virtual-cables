@@ -569,66 +569,28 @@ fn one_playback_urb_at_a_time_completes_after_its_last_frame() {
     session.join().unwrap();
 }
 
-/// Three or more halt clears within a few frames of each other are a reset
-/// loop, and the loop breaker may act on one at most once a second.
+/// A playback URB that continues its stream on frames that have already
+/// begun gets those packets reported as not sent, as a host controller
+/// reports them; the rest are sent.
 #[test]
-fn reset_loop_is_detected_and_breaks_are_rate_limited() {
-    let state = discard_state();
-    let clear = |frame| state.clear_endpoint_halt(1, test_bus_time(frame));
-    // Resets spread out: recoveries, not a loop.
-    for frame in [1000, 1100, 1200] {
-        clear(frame);
-    }
-    assert!(!state.take_loop_break(1, 1210));
-    // Resets every 10 frames: a loop.
-    for frame in [2000, 2010] {
-        clear(frame);
-    }
-    assert!(!state.take_loop_break(1, 2015), "two resets are not yet a loop");
-    clear(2020);
-    assert!(state.take_loop_break(1, 2025));
-    clear(2030);
-    assert!(!state.take_loop_break(1, 2035), "at most once a second");
-    for frame in (3030..=3060).step_by(10) {
-        clear(frame);
-    }
-    assert!(state.take_loop_break(1, 3065));
-    assert!(!state.take_loop_break(1, 5000) && lock(&state.sched).loop_breaks == 2, "the loop ended");
-}
-
-/// In a reset loop, a lone playback URB's completion is held for up to
-/// `LOOP_BREAK_HOLD`, and released as soon as another URB is queued.
-#[test]
-fn loop_breaker_holds_a_lone_urb_until_another_arrives() {
+fn late_playback_packets_are_reported_as_not_sent() {
     let device = active_device(DEFAULT_LATENCY_MS);
-    let server = Server::new("", Vec::new(), Logger::discard());
-    let event = Event::new();
-    let state = discard_state();
-    let held = |state: &ConnState| {
-        let started = Instant::now();
-        server.break_reset_loop(&device, state, 1, &event, &|| false).unwrap();
-        started.elapsed()
-    };
-    state.add_pending(1, 1, token());
-    assert!(held(&state) < Duration::from_millis(5), "held outside a loop");
+    let (mut host, server_side) = socket_pair();
+    let session = start_session(Arc::clone(&device), server_side);
 
-    let now = current_bus_time().frame();
-    for frame in [now - 20, now - 10, now] {
-        state.clear_endpoint_halt(1, test_bus_time(frame));
-    }
-    assert!(held(&state) >= Duration::from_millis(9), "a lone URB in a loop was not held");
+    host.write_all(&iso_submit(1, DIRECTION_OUT, 1, 10)).unwrap();
+    let on_time = read_reply(&mut host, |_| 0).unwrap();
+    assert_eq!((on_time.status, on_time.error_count), (0, 0), "a URB sent ahead of its frames");
 
-    // The next break, a second later, ends as soon as another URB is queued.
-    lock(&state.sched).last_loop_break = None;
-    let took = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(3));
-            state.add_pending(2, 1, token());
-            event.signal();
-        });
-        held(&state)
-    });
-    assert!(took < Duration::from_millis(9), "held for {took:?} after another URB was queued");
+    // The next URB continues the stream, but arrives a few frames late.
+    std::thread::sleep(Duration::from_millis(4));
+    host.write_all(&iso_submit(2, DIRECTION_OUT, 1, 10)).unwrap();
+    let late = read_reply(&mut host, |_| 0).unwrap();
+    assert_eq!(late.start_frame, on_time.start_frame + 10, "the stream continues");
+    assert_eq!(late.status, 0);
+    assert!((1..10).contains(&late.error_count), "{} packets reported late", late.error_count);
+    host.shutdown(std::net::Shutdown::Both).unwrap();
+    session.join().unwrap();
 }
 
 /// The stall test holds every isochronous completion for its length once a

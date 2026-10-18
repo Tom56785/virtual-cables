@@ -395,6 +395,11 @@ impl Server {
                         if self.playback_completion == PlaybackCompletion::Start {
                             submit.early_at = Some(now.frame_start(slot.start));
                         }
+                        // A host controller cannot send a packet on a frame
+                        // that has already begun; it reports it as not sent.
+                        // The audio still plays: the delay line has room.
+                        let packets = submit.packets.len() as u64;
+                        submit.late_packets = (now.frame() + 1).saturating_sub(slot.start).min(packets) as u32;
                     }
                     if slot.resynced && self.diagnostics {
                         let count = self.iso_resync_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -532,8 +537,7 @@ impl Server {
                 };
                 let completed = match early {
                     Ok(true) => self.hold_for_stall_test(event, &cancelled),
-                    Ok(false) => complete(submit)
-                        .and_then(|()| self.break_reset_loop(device, state, req.basic.endpoint, event, &cancelled)),
+                    Ok(false) => complete(submit),
                     Err(cancelled) => Err(cancelled),
                 };
                 if completed.is_err() {
@@ -541,7 +545,13 @@ impl Server {
                 }
                 let actual = submit.out.len();
                 mark_iso_packets(&mut submit.packets, actual);
-                state.write_submit(submit, STATUS_OK, actual as u32, &[], &submit.packets, 0)
+                let late = mark_late_packets(&mut submit.packets, submit.late_packets);
+                if late > 0 {
+                    state.count_late_packets(late);
+                }
+                let actual = submit.packets.iter().map(|p| p.actual_length).sum::<u32>();
+                let actual = if submit.packets.is_empty() { submit.out.len() as u32 } else { actual };
+                state.write_submit(submit, STATUS_OK, actual, &[], &submit.packets, late)
             }
             (2, DIRECTION_IN) => {
                 if complete(submit).is_err() {
@@ -563,38 +573,6 @@ impl Server {
             }
             _ => fail(submit, STATUS_PIPE),
         }
-    }
-
-    /// Breaks usbaudio's reset loop, in which it resets the playback pipe
-    /// after every URB. In the loop it sends a single URB after each reset,
-    /// so its completion always leaves nothing queued. Every time usbaudio
-    /// recovered from a reset by itself, it had first found the pipe idle for
-    /// several frames, and then sent two or more URBs. So when the endpoint is
-    /// in a reset loop and this URB has nothing queued behind it, its
-    /// completion is held for up to `LOOP_BREAK_HOLD`, until another URB
-    /// arrives, at most once per `LOOP_BREAK_INTERVAL_FRAMES`.
-    fn break_reset_loop(
-        &self,
-        device: &Device,
-        state: &ConnState,
-        endpoint: u32,
-        event: &Event,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), Cancelled> {
-        if state.iso_pending(endpoint) > 1 || !state.take_loop_break(endpoint, current_bus_time().frame()) {
-            return Ok(());
-        }
-        if self.diagnostics {
-            logf!(self.logger, "{} LOOP BREAK ep={endpoint}: holding a lone playback URB", device.bus_id);
-        }
-        let until = Instant::now() + LOOP_BREAK_HOLD;
-        while state.iso_pending(endpoint) <= 1 && Instant::now() < until {
-            if cancelled() {
-                return Err(Cancelled);
-            }
-            event.wait(Some(until));
-        }
-        Ok(())
     }
 
     /// For the stall test: during the first `stall_test` of every minute after
@@ -712,7 +690,7 @@ impl Server {
                 playback_resyncs: s.iso_resyncs.get(&1).copied().unwrap_or(0),
                 capture_resyncs: s.iso_resyncs.get(&2).copied().unwrap_or(0),
                 halt_clears: s.halt_clears,
-                loop_breaks: s.loop_breaks,
+                late_packets: s.late_packets,
             }
         };
         let Some(previous) = report.reported.replace(health) else {
@@ -723,7 +701,7 @@ impl Server {
         }
         logf!(
             self.logger,
-            "{} AUDIO HEALTH missing_ms={} (+{}) realigned={} (+{}) caught_up={} (+{}) latency_ms={} playback_resyncs={} capture_resyncs={} halt_clears={} loop_breaks={}",
+            "{} AUDIO HEALTH missing_ms={} (+{}) realigned={} (+{}) caught_up={} (+{}) latency_ms={} playback_resyncs={} capture_resyncs={} halt_clears={} late_packets={}",
             device.bus_id,
             health.missing,
             health.missing - previous.missing,
@@ -735,7 +713,7 @@ impl Server {
             health.playback_resyncs,
             health.capture_resyncs,
             health.halt_clears,
-            health.loop_breaks
+            health.late_packets
         );
     }
 
@@ -909,7 +887,7 @@ struct Health {
     playback_resyncs: u64,
     capture_resyncs: u64,
     halt_clears: u64,
-    loop_breaks: u64,
+    late_packets: u64,
 }
 
 struct WriterState {
@@ -927,29 +905,10 @@ struct Schedule {
     /// health report.
     iso_resyncs: HashMap<u32, u64>,
     halt_clears: u64,
-    /// Recent halt clears by endpoint, to detect usbaudio's reset loop.
-    reset_runs: HashMap<u32, ResetRun>,
-    /// When the loop breaker last held a completion, and how often it has.
-    last_loop_break: Option<u64>,
-    loop_breaks: u64,
+    /// Playback packets reported as not sent because their frame had begun
+    /// before they arrived.
+    late_packets: u64,
 }
-
-/// A run of halt clears on an endpoint, each within `RESET_LOOP_FRAMES` of
-/// the one before.
-#[derive(Clone, Copy)]
-struct ResetRun {
-    last_frame: u64,
-    length: u32,
-}
-
-/// Halt clears this close together, in frames, belong to one reset loop.
-const RESET_LOOP_FRAMES: u64 = 30;
-/// How many halt clears in a row make a reset loop.
-const RESET_LOOP_LENGTH: u32 = 3;
-/// How long the loop breaker holds a lone playback URB's completion.
-const LOOP_BREAK_HOLD: Duration = Duration::from_millis(10);
-/// The loop breaker holds a completion at most once per this many frames.
-const LOOP_BREAK_INTERVAL_FRAMES: u64 = 1000;
 
 /// How far the schedule of a reset pipe may have fallen behind the bus clock
 /// and still be continued. A host that resubmits within this window is still
@@ -1062,28 +1021,11 @@ impl ConnState {
     pub(crate) fn clear_endpoint_halt(&self, endpoint: u32, now: BusTime) {
         let mut s = lock(&self.sched);
         s.halt_clears += 1;
-        let frame = now.frame();
-        let run = s.reset_runs.entry(endpoint).or_insert(ResetRun { last_frame: 0, length: 0 });
-        let continues = run.length > 0 && frame <= run.last_frame + RESET_LOOP_FRAMES;
-        run.length = if continues { run.length + 1 } else { 1 };
-        run.last_frame = frame;
-        s.rewind_iso_timeline(endpoint, frame);
+        s.rewind_iso_timeline(endpoint, now.frame());
     }
 
-    /// Whether the endpoint is in a reset loop, at bus frame `frame`, and the
-    /// loop breaker may hold a completion now; if so, records that it does.
-    pub(crate) fn take_loop_break(&self, endpoint: u32, frame: u64) -> bool {
-        let mut s = lock(&self.sched);
-        let in_loop = s
-            .reset_runs
-            .get(&endpoint)
-            .is_some_and(|run| run.length >= RESET_LOOP_LENGTH && frame <= run.last_frame + RESET_LOOP_FRAMES);
-        if !in_loop || s.last_loop_break.is_some_and(|at| frame < at + LOOP_BREAK_INTERVAL_FRAMES) {
-            return false;
-        }
-        s.last_loop_break = Some(frame);
-        s.loop_breaks += 1;
-        true
+    pub(crate) fn count_late_packets(&self, count: u32) {
+        lock(&self.sched).late_packets += count as u64;
     }
 
     /// How many URBs are pending on an endpoint.
@@ -1257,6 +1199,9 @@ pub(crate) struct ParsedSubmit {
     /// For a playback URB with `PlaybackCompletion::Start`: when its first
     /// frame begins, the earliest it may complete.
     pub early_at: Option<Instant>,
+    /// For a playback URB: how many of its first packets were scheduled on
+    /// frames that had already begun when it arrived.
+    pub late_packets: u32,
     /// Tracked URBs are registered as pending and may be unlinked.
     pub tracked: bool,
     /// The start frame the host requested, before scheduling replaces it. It is
@@ -1282,6 +1227,7 @@ impl ParsedSubmit {
             start: 0,
             complete_frame: 0,
             early_at: None,
+            late_packets: 0,
             tracked: false,
             host_start_frame: 0,
             in_flight: 0,
@@ -1529,6 +1475,17 @@ pub(crate) fn mark_iso_packets(packets: &mut [IsoPacket], actual_total: usize) {
         packet.actual_length = wanted as u32;
         remaining -= wanted;
     }
+}
+
+/// Marks the first `late` packets as not sent because their frame had passed,
+/// as a host controller reports them, and returns how many it marked.
+fn mark_late_packets(packets: &mut [IsoPacket], late: u32) -> u32 {
+    let late = (late as usize).min(packets.len());
+    for packet in &mut packets[..late] {
+        packet.actual_length = 0;
+        packet.status = STATUS_ISO_LATE;
+    }
+    late as u32
 }
 
 fn mark_iso_error(packets: &mut [IsoPacket], status: i32) {
