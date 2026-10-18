@@ -242,7 +242,12 @@ pub fn run_attach_helper(ids: &[u32], full: bool, target: &ServerTarget, logger:
         }
     }
     for bus_id in &plan.attach {
-        if let Err(err) = run_usbip(&executable, logger, &target.command(&port, &["attach", "-b", bus_id])) {
+        // Low-latency receive completes each URB from usbip-win2's network
+        // event callback instead of a per-device receive thread, so replies
+        // reach Windows without a thread switch. Audio sends small URBs at a
+        // high rate, which is what that mode is for.
+        let attach = ["attach", "-b", bus_id, "--receive-mode", "low-latency"];
+        if let Err(err) = run_usbip(&executable, logger, &target.command(&port, &attach)) {
             return Err(format!("attach {bus_id} failed: {err}"));
         }
     }
