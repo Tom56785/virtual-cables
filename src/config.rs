@@ -15,7 +15,7 @@ use crate::logging::Logger;
 use crate::uac2::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
 
 pub const MAX_CABLES: usize = 32;
-/// Cable IDs fit the USB product IDs 0xCA01-0xCAFF.
+/// Cable IDs fit the USB product IDs 0xCB01-0xCBFF.
 pub const MAX_CABLE_ID: u32 = 255;
 pub const MAX_CABLE_NAME: usize = 64;
 /// Built-in settings, used when neither config.toml nor a command-line flag

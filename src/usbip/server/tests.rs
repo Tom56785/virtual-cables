@@ -67,19 +67,33 @@ fn iso_completions_are_serialized_per_endpoint() {
     assert_eq!(other_endpoint.start_frame, 1001, "independent endpoint");
 }
 
+/// A URB whose slot has begun starts on the next bus frame, never in the past,
+/// as a host controller schedules a late ASAP transfer.
 #[test]
-fn late_iso_submit_stays_contiguous() {
+fn late_iso_submit_starts_on_next_frame() {
     let state = discard_state();
     state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
+    state.add_pending(1, 1, token());
 
-    // Submitted 190 frames after the previous URB ended: keep the stream
-    // position and complete as soon as possible.
-    let late = state.reserve_iso_completion(1, 10, test_bus_time(1200));
-    assert_eq!((late.start_frame, late.resynced), (1011, false));
+    // Its slot is still ahead: the stream stays contiguous.
+    let on_time = state.reserve_iso_completion(1, 10, test_bus_time(1010));
+    assert_eq!((on_time.start_frame, on_time.resynced), (1011, false));
 
-    // Far behind: the stream stopped, so restart on the next bus frame.
-    let stalled = state.reserve_iso_completion(1, 10, test_bus_time(5000));
-    assert_eq!((stalled.start_frame, stalled.resynced), (5001, true));
+    // Frame 1021 has begun, so the slot after the queue has passed.
+    let now = test_bus_time(1021);
+    let late = state.reserve_iso_completion(1, 10, now);
+    assert_eq!((late.start_frame, late.resynced), (1022, true));
+    assert_eq!(late.deadline.unwrap() - now.wall, Duration::from_millis(11));
+}
+
+/// With nothing queued, the previous stream has ended: the next URB starts a
+/// new one on the next bus frame.
+#[test]
+fn iso_submit_after_idle_starts_new_stream() {
+    let state = discard_state();
+    state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
+    let next = state.reserve_iso_completion(1, 10, test_bus_time(1012));
+    assert_eq!((next.start_frame, next.resynced), (1013, false));
 }
 
 #[test]
@@ -94,7 +108,7 @@ fn unlinked_urb_gets_only_ret_unlink() {
     submit.tracked = true;
     state.add_pending(7, 1, token());
 
-    let (found, result) = state.unlink(&BasicHeader { sequence: 8, ..Default::default() }, 7, test_bus_time(1000));
+    let (found, result) = state.unlink(&BasicHeader { sequence: 8, ..Default::default() }, 7);
     result.unwrap();
     assert!(found);
     let unlink_reply = out.bytes().len();
@@ -105,7 +119,7 @@ fn unlinked_urb_gets_only_ret_unlink() {
     assert_eq!(be32(&wire, 20) as i32, STATUS_CONN_RESET);
 
     // Unlinking an already completed URB succeeds with status 0.
-    let (found, _) = state.unlink(&BasicHeader { sequence: 9, ..Default::default() }, 7, test_bus_time(1000));
+    let (found, _) = state.unlink(&BasicHeader { sequence: 9, ..Default::default() }, 7);
     assert!(!found, "completed URB reported as pending");
 }
 
@@ -118,7 +132,7 @@ fn unlink_resets_idle_iso_timeline() {
         state.add_pending(seq, 1, token());
     }
     for seq in 1..=4 {
-        state.unlink(&BasicHeader { sequence: 100 + seq, ..Default::default() }, seq, now).1.unwrap();
+        state.unlink(&BasicHeader { sequence: 100 + seq, ..Default::default() }, seq).1.unwrap();
     }
     // The aborted URBs reserved 40 frames; the restarted stream must not wait for it.
     assert_eq!(state.reserve_iso_completion(1, 10, now).start_frame, 1001);
@@ -130,32 +144,20 @@ fn clear_halt_resets_iso_timeline() {
     let now = test_bus_time(1000);
     state.reserve_iso_completion(1, 10, now);
     state.reserve_iso_completion(1, 10, now);
-    reset_timelines_after_control(&state, &CLEAR_HALT, now);
+    reset_timelines_after_control(&state, &CLEAR_HALT);
     assert_eq!(state.reserve_iso_completion(1, 10, now).start_frame, 1001);
 }
 
-/// After a stall, usbaudio can reset the pipe after every URB with one URB in
-/// flight. The schedule must still advance one frame per frame, or playback
-/// runs slower than real time and capture underruns permanently.
+/// The first ASAP transfer after a pipe reset begins on the next frame, as
+/// the Windows USB stack documents, even right after the previous one ended.
 #[test]
-fn clear_halt_after_each_urb_keeps_real_time() {
+fn clear_halt_restarts_on_next_frame() {
     let state = discard_state();
-    let mut slot = state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
-    for i in 0..100 {
-        // The URB completes, the host clears the halt and resubmits 2 frames later.
-        reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(slot.end_frame + 1));
-        let next = state.reserve_iso_completion(1, 10, test_bus_time(slot.end_frame + 2));
-        assert_eq!(next.start_frame as u64, slot.end_frame, "URB {i} not contiguous");
-        slot = next;
-    }
-}
-
-#[test]
-fn clear_halt_restarts_stale_iso_timeline() {
-    let state = discard_state();
-    state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
-    reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(1100));
-    assert_eq!(state.reserve_iso_completion(1, 10, test_bus_time(1100)).start_frame, 1101);
+    let slot = state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
+    // The URB completes, the host clears the halt and resubmits 2 frames later.
+    reset_timelines_after_control(&state, &CLEAR_HALT);
+    let next = state.reserve_iso_completion(1, 10, test_bus_time(slot.end_frame + 2));
+    assert_eq!((next.start_frame as u64, next.resynced), (slot.end_frame + 3, false));
 }
 
 #[test]
@@ -165,7 +167,7 @@ fn set_interface_restarts_idle_iso_timeline() {
     state.reserve_iso_completion(1, 10, now);
     let set_interface =
         SetupPacket { request_type: 0x01, request: REQUEST_SET_INTERFACE, value: 1, index: 1, length: 0 };
-    reset_timelines_after_control(&state, &set_interface, test_bus_time(1003));
+    reset_timelines_after_control(&state, &set_interface);
     assert_eq!(state.reserve_iso_completion(1, 10, test_bus_time(1003)).start_frame, 1004);
 }
 
@@ -260,8 +262,9 @@ fn audio_health_reports_changes() {
     assert_eq!(lines(), "", "logged without a change");
 
     state.reserve_iso_completion(1, 10, test_bus_time(1000));
+    state.add_pending(1, 1, token()); // still queued, so the next URB is late
     state.reserve_iso_completion(1, 10, test_bus_time(5000)); // too late: resynced
-    reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(5000));
+    reset_timelines_after_control(&state, &CLEAR_HALT);
     s.report_audio_health(&state, &device);
     assert_eq!(lines(), "", "logged again within the interval");
     allow_check();
@@ -529,30 +532,6 @@ fn one_playback_urb_at_a_time_completes_after_its_last_frame() {
     session.join().unwrap();
 }
 
-/// A playback URB that continues its stream on frames that have already
-/// begun gets those packets reported as not sent, as a host controller
-/// reports them; the rest are sent.
-#[test]
-fn late_playback_packets_are_reported_as_not_sent() {
-    let device = active_device(DEFAULT_LATENCY_MS);
-    let (mut host, server_side) = socket_pair();
-    let session = start_session(Arc::clone(&device), server_side);
-
-    host.write_all(&iso_submit(1, DIRECTION_OUT, 1, 10)).unwrap();
-    let on_time = read_reply(&mut host, |_| 0).unwrap();
-    assert_eq!((on_time.status, on_time.error_count), (0, 0), "a URB sent ahead of its frames");
-
-    // The next URB continues the stream, but arrives a few frames late.
-    std::thread::sleep(Duration::from_millis(4));
-    host.write_all(&iso_submit(2, DIRECTION_OUT, 1, 10)).unwrap();
-    let late = read_reply(&mut host, |_| 0).unwrap();
-    assert_eq!(late.start_frame, on_time.start_frame + 10, "the stream continues");
-    assert_eq!(late.status, 0);
-    assert!((1..10).contains(&late.error_count), "{} packets reported late", late.error_count);
-    host.shutdown(std::net::Shutdown::Both).unwrap();
-    session.join().unwrap();
-}
-
 /// The stall test holds every isochronous completion for its length once a
 /// minute, after the first minute.
 #[test]
@@ -584,8 +563,7 @@ fn unlink_interrupts_waiting_urb() {
     let (mut host, server_side) = socket_pair();
     let session = start_session(device, server_side);
 
-    // A 255-packet capture URB would otherwise complete a quarter second
-    // later. (Playback URBs complete at their first frame.)
+    // 255 packets: the URB would otherwise complete a quarter second later.
     host.write_all(&iso_submit(1, DIRECTION_IN, 2, 255)).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     let started = Instant::now();

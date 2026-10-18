@@ -113,7 +113,6 @@ The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at ea
   - `realigned`: how often playback arrived too late to play on time, so its stream was moved later.
   - `caught_up`: how often a stream that had been moved later was moved back once Windows caught up.
   - `playback_resyncs`, `capture_resyncs` and `halt_clears`: stream restarts, and stream resets by Windows.
-  - `late_packets`: playback packets Windows sent for frames that had already begun, which are reported back as not sent, as a USB controller does. Their audio still plays.
 
   `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly. This happened with the USB Audio 1.0 driver, which the cables no longer use. `stall_test_ms = 30` reproduces a system stall once a minute, so recovery can be checked quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
 

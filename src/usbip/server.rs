@@ -351,11 +351,6 @@ impl Server {
                         // frames as soon as it arrives, so it plays at its
                         // frame however late its URB completes.
                         device.write_playback(slot.start, iso_payloads(&submit.out, &submit.packets));
-                        // A host controller cannot send a packet on a frame
-                        // that has already begun; it reports it as not sent.
-                        // The audio still plays: the delay line has room.
-                        let packets = submit.packets.len() as u64;
-                        submit.late_packets = (now.frame() + 1).saturating_sub(slot.start).min(packets) as u32;
                     }
                     if slot.resynced && self.diagnostics {
                         let count = self.iso_resync_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -392,7 +387,7 @@ impl Server {
                         Ok(body) => u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
                         Err(_) => break,
                     };
-                    let (found, result) = state.unlink(&basic, target, current_bus_time());
+                    let (found, result) = state.unlink(&basic, target);
                     // Windows unlinks every queued URB on a pipe abort. Logging each
                     // one synchronously on this reader loop delays following SUBMITs.
                     if self.diagnostics {
@@ -448,7 +443,7 @@ impl Server {
                 if is_endpoint_halt_clear(&setup) {
                     self.trace_endpoint_halt(device, state, &setup, now);
                 }
-                reset_timelines_after_control(state, &setup, now);
+                reset_timelines_after_control(state, &setup);
             }
             data.truncate(req.transfer_buffer_length as usize);
             let mut actual = data.len() as u32;
@@ -483,15 +478,12 @@ impl Server {
                 if complete(submit).is_err() {
                     return fail(submit, STATUS_CONN_RESET);
                 }
+                if device.playback_active() {
+                    self.report_audio_health(state, device);
+                }
                 let actual = submit.out.len();
                 mark_iso_packets(&mut submit.packets, actual);
-                let late = mark_late_packets(&mut submit.packets, submit.late_packets);
-                if late > 0 {
-                    state.count_late_packets(late);
-                }
-                let actual = submit.packets.iter().map(|p| p.actual_length).sum::<u32>();
-                let actual = if submit.packets.is_empty() { submit.out.len() as u32 } else { actual };
-                state.write_submit(submit, STATUS_OK, actual, &[], &submit.packets, late)
+                state.write_submit(submit, STATUS_OK, actual as u32, &[], &submit.packets, 0)
             }
             (2, DIRECTION_IN) => {
                 if complete(submit).is_err() {
@@ -630,7 +622,6 @@ impl Server {
                 playback_resyncs: s.iso_resyncs.get(&1).copied().unwrap_or(0),
                 capture_resyncs: s.iso_resyncs.get(&2).copied().unwrap_or(0),
                 halt_clears: s.halt_clears,
-                late_packets: s.late_packets,
             }
         };
         let Some(previous) = report.reported.replace(health) else {
@@ -641,7 +632,7 @@ impl Server {
         }
         logf!(
             self.logger,
-            "{} AUDIO HEALTH missing_ms={} (+{}) realigned={} (+{}) caught_up={} (+{}) latency_ms={} playback_resyncs={} capture_resyncs={} halt_clears={} late_packets={}",
+            "{} AUDIO HEALTH missing_ms={} (+{}) realigned={} (+{}) caught_up={} (+{}) latency_ms={} playback_resyncs={} capture_resyncs={} halt_clears={}",
             device.bus_id,
             health.missing,
             health.missing - previous.missing,
@@ -652,8 +643,7 @@ impl Server {
             device.audio.delay(),
             health.playback_resyncs,
             health.capture_resyncs,
-            health.halt_clears,
-            health.late_packets
+            health.halt_clears
         );
     }
 
@@ -827,7 +817,6 @@ struct Health {
     playback_resyncs: u64,
     capture_resyncs: u64,
     halt_clears: u64,
-    late_packets: u64,
 }
 
 struct WriterState {
@@ -845,28 +834,7 @@ struct Schedule {
     /// health report.
     iso_resyncs: HashMap<u32, u64>,
     halt_clears: u64,
-    /// Playback packets reported as not sent because their frame had begun
-    /// before they arrived.
-    late_packets: u64,
 }
-
-/// How far the schedule of a reset pipe may have fallen behind the bus clock
-/// and still be continued. A host that resubmits within this window is still
-/// streaming; beyond it the stream is restarted.
-const MAX_ISO_RESET_LAG_FRAMES: u64 = 16;
-
-/// How late a URB may be and still continue its stream. Within this window a
-/// late URB keeps its frames and completes immediately, so the host catches up
-/// without the reported stream position jumping.
-///
-/// This departs from Linux host controllers, which move a late URB_ISO_ASAP
-/// transfer to the first unexpired frame, and from the Windows USB stack
-/// documentation, which starts the first transfer after a pipe reset on the
-/// next frame. Doing both was tried: it did not end usbaudio's
-/// reset-after-every-URB loop, but made each 10-frame URB in it take 12
-/// frames, so playback ran at 83% of real time and capture underran
-/// continuously.
-const MAX_ISO_LATE_FRAMES: u64 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IsoSlot {
@@ -878,61 +846,39 @@ pub(crate) struct IsoSlot {
     /// reaches it.
     pub end_frame: u64,
     pub deadline: Option<Instant>,
-    /// The schedule had fallen too far behind and was restarted at the next
-    /// bus frame.
+    /// The URB arrived after its slot in a running stream had begun, and was
+    /// moved to the next bus frame.
     pub resynced: bool,
 }
 
 impl Schedule {
     /// Discards the completion schedule of an idle endpoint, so its next URB
-    /// starts a new stream. Used when the stream is stopped by SET_INTERFACE or
-    /// SET_CONFIGURATION.
+    /// starts a new stream on the next bus frame. Used when the host stops the
+    /// stream (SET_INTERFACE or SET_CONFIGURATION), aborts it (an UNLINK of
+    /// every queued URB) or resets the pipe (CLEAR_FEATURE(ENDPOINT_HALT)).
+    ///
+    /// For a reset this is what the Windows USB stack documents for ASAP
+    /// transfers: the first transfer after the pipe "was opened or last reset"
+    /// begins on the next frame. For an abort, it also discards the future
+    /// slots of the unlinked URBs, which would otherwise push every later
+    /// completion further into the future.
     fn reset_iso_timeline(&mut self, endpoint: u32) {
         if self.iso_pending.get(&endpoint).copied().unwrap_or(0) == 0 {
             self.iso_next.remove(&endpoint);
         }
     }
 
-    /// Handles a pipe reset (an abort that unlinks queued URBs, or
-    /// CLEAR_FEATURE(ENDPOINT_HALT)) on an idle endpoint.
-    ///
-    /// Unlinked URBs complete immediately but their reserved slots remain on
-    /// the timeline. Those future slots are discarded: otherwise every pipe
-    /// abort pushes all later completions further into the future, so the host
-    /// streams less than real time and the opposite endpoint gradually drains
-    /// the ring.
-    ///
-    /// A schedule that has just ended is kept, though. After a stall, usbaudio
-    /// can fall into resetting the pipe after every URB, with a single URB in
-    /// flight. Restarting each URB on the next bus frame then adds the reset's
-    /// round trip to every 10 ms URB, and playback runs ~20% slower than real
-    /// time, permanently underrunning capture. Continuing the schedule absorbs
-    /// that round trip, so the stream still advances one frame per frame.
-    fn rewind_iso_timeline(&mut self, endpoint: u32, current: u64) {
-        if self.iso_pending.get(&endpoint).copied().unwrap_or(0) != 0 {
-            return;
-        }
-        let Some(&next) = self.iso_next.get(&endpoint) else {
-            return;
-        };
-        if next > current + 1 {
-            self.iso_next.insert(endpoint, current + 1);
-        } else if next + MAX_ISO_RESET_LAG_FRAMES < current + 1 {
-            self.iso_next.remove(&endpoint);
-        }
-    }
-
     /// Removes a pending URB so that exactly one reply is sent for it. When
     /// unlinked, the URB is also cancelled, and an endpoint left idle by the
-    /// unlink has its completion timeline rewound.
-    fn claim_pending(&mut self, sequence: u32, unlinked: bool, current_frame: u64) -> bool {
+    /// unlink starts a new stream with its next URB.
+    fn claim_pending(&mut self, sequence: u32, unlinked: bool) -> bool {
         let Some(entry) = self.pending.remove(&sequence) else {
             return false;
         };
         *self.iso_pending.entry(entry.endpoint).or_default() -= 1;
         if unlinked {
             entry.cancel.cancel();
-            self.rewind_iso_timeline(entry.endpoint, current_frame);
+            self.reset_iso_timeline(entry.endpoint);
         }
         true
     }
@@ -958,14 +904,10 @@ impl ConnState {
     }
 
     /// Handles CLEAR_FEATURE(ENDPOINT_HALT): the host has reset the pipe.
-    pub(crate) fn clear_endpoint_halt(&self, endpoint: u32, now: BusTime) {
+    pub(crate) fn clear_endpoint_halt(&self, endpoint: u32) {
         let mut s = lock(&self.sched);
         s.halt_clears += 1;
-        s.rewind_iso_timeline(endpoint, now.frame());
-    }
-
-    pub(crate) fn count_late_packets(&self, count: u32) {
-        lock(&self.sched).late_packets += count as u64;
+        s.reset_iso_timeline(endpoint);
     }
 
     /// Reports how many URBs are pending on an endpoint and how far its next
@@ -986,6 +928,12 @@ impl ConnState {
     /// schedule (not the arrival time) sets the cadence. Because the schedule is
     /// on the host's bus clock, completions never drift against the frame
     /// numbers Windows uses to track the stream.
+    ///
+    /// A URB never starts on a frame that has already begun: if its slot has
+    /// passed, it starts on the next bus frame, as host controllers move a
+    /// late ASAP transfer to the first frame they can still send it in. If no
+    /// other URB is queued, the stream had simply ended, and the URB starts a
+    /// new one.
     pub(crate) fn reserve_iso_completion(&self, endpoint: u32, packets: u32, now: BusTime) -> IsoSlot {
         if packets == 0 {
             return IsoSlot {
@@ -1002,9 +950,9 @@ impl ConnState {
         let current = now.frame();
         let mut resynced = false;
         let start = match s.iso_next.get(&endpoint) {
-            Some(&next) if next + MAX_ISO_LATE_FRAMES >= current => next,
+            Some(&next) if next > current => next,
             scheduled => {
-                resynced = scheduled.is_some();
+                resynced = scheduled.is_some() && s.iso_pending.get(&endpoint).copied().unwrap_or(0) > 0;
                 current + 1
             }
         };
@@ -1031,7 +979,7 @@ impl ConnState {
         error_count: u32,
     ) -> io::Result<()> {
         let mut w = lock(&self.writer);
-        if submit.tracked && !lock(&self.sched).claim_pending(submit.req.basic.sequence, false, 0) {
+        if submit.tracked && !lock(&self.sched).claim_pending(submit.req.basic.sequence, false) {
             return Ok(());
         }
         let w = &mut *w;
@@ -1042,9 +990,9 @@ impl ConnState {
 
     /// Claims a pending URB, cancels it and replies with RET_UNLINK. Reports
     /// whether the URB was still pending, and the result of the reply write.
-    pub(crate) fn unlink(&self, req: &BasicHeader, target: u32, now: BusTime) -> (bool, io::Result<()>) {
+    pub(crate) fn unlink(&self, req: &BasicHeader, target: u32) -> (bool, io::Result<()>) {
         let mut w = lock(&self.writer);
-        let found = lock(&self.sched).claim_pending(target, true, now.frame());
+        let found = lock(&self.sched).claim_pending(target, true);
         // The protocol specifies -ECONNRESET for a successful unlink.
         let status = if found { STATUS_CONN_RESET } else { STATUS_OK };
         let w = &mut *w;
@@ -1131,9 +1079,6 @@ pub(crate) struct ParsedSubmit {
     pub start: u64,
     pub complete_at: Option<Instant>,
     pub complete_frame: u64,
-    /// For a playback URB: how many of its first packets were scheduled on
-    /// frames that had already begun when it arrived.
-    pub late_packets: u32,
     /// Tracked URBs are registered as pending and may be unlinked.
     pub tracked: bool,
     /// The start frame the host requested, before scheduling replaces it. It is
@@ -1158,7 +1103,6 @@ impl ParsedSubmit {
             complete_at: None,
             start: 0,
             complete_frame: 0,
-            late_packets: 0,
             tracked: false,
             host_start_frame: 0,
             in_flight: 0,
@@ -1305,9 +1249,9 @@ const HALT_BURST_LINES: u64 = 30;
 /// streaming again; the new stream must not wait for the slots of the
 /// discarded URBs. Selecting an interface or configuration stops the stream,
 /// so its next URB starts a new schedule.
-pub(crate) fn reset_timelines_after_control(state: &ConnState, setup: &SetupPacket, now: BusTime) {
+pub(crate) fn reset_timelines_after_control(state: &ConnState, setup: &SetupPacket) {
     if is_endpoint_halt_clear(setup) {
-        state.clear_endpoint_halt((setup.index & 0x0f) as u32, now);
+        state.clear_endpoint_halt((setup.index & 0x0f) as u32);
     } else if (setup.request_type == 0x01 && setup.request == uac2::REQUEST_SET_INTERFACE)
         || (setup.request_type == 0x00 && setup.request == uac2::REQUEST_SET_CONFIGURATION)
     {
@@ -1364,17 +1308,6 @@ pub(crate) fn mark_iso_packets(packets: &mut [IsoPacket], actual_total: usize) {
         packet.actual_length = wanted as u32;
         remaining -= wanted;
     }
-}
-
-/// Marks the first `late` packets as not sent because their frame had passed,
-/// as a host controller reports them, and returns how many it marked.
-fn mark_late_packets(packets: &mut [IsoPacket], late: u32) -> u32 {
-    let late = (late as usize).min(packets.len());
-    for packet in &mut packets[..late] {
-        packet.actual_length = 0;
-        packet.status = STATUS_ISO_LATE;
-    }
-    late as u32
 }
 
 fn mark_iso_error(packets: &mut [IsoPacket], status: i32) {

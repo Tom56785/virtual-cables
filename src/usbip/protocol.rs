@@ -29,9 +29,6 @@ pub const STATUS_NO_ENTRY: i32 = -2;
 pub const STATUS_INVALID: i32 = -22;
 pub const STATUS_PIPE: i32 = -32;
 pub const STATUS_CONN_RESET: i32 = -104;
-/// EXDEV: an isochronous packet was not transferred, because its frame had
-/// passed. usbip-win2 reports it to Windows as USBD_STATUS_ISO_TD_ERROR.
-pub const STATUS_ISO_LATE: i32 = -18;
 
 pub const BASIC_HEADER_SIZE: usize = 20;
 /// Transfer fields and setup packet after the basic header.
