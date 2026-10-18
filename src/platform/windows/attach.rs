@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use crate::logf;
 use crate::logging::Logger;
-use crate::uac1::bus_id;
+use crate::uac2::{PRODUCT_ID_BASE, bus_id};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -258,7 +258,7 @@ pub fn run_attach_helper(ids: &[u32], full: bool, target: &ServerTarget, logger:
 /// The Windows instance ID of a cable's USB device, which its USB vendor ID,
 /// product ID and serial number make up.
 pub fn cable_instance_id(id: u32, serial: &str) -> String {
-    format!("USB\\VID_FFFF&PID_{:04X}\\{serial}", 0xCA00 + id)
+    format!("USB\\VID_FFFF&PID_{:04X}\\{serial}", PRODUCT_ID_BASE + id)
 }
 
 /// Removes a removed cable's devices from Windows: its USB device and, with
@@ -335,8 +335,8 @@ mod tests {
 
     #[test]
     fn cable_instance_ids() {
-        assert_eq!(cable_instance_id(1, "8F3A2C1D"), "USB\\VID_FFFF&PID_CA01\\8F3A2C1D");
-        assert_eq!(cable_instance_id(255, "VCABLE-255"), "USB\\VID_FFFF&PID_CAFF\\VCABLE-255");
+        assert_eq!(cable_instance_id(1, "8F3A2C1D"), "USB\\VID_FFFF&PID_CB01\\8F3A2C1D");
+        assert_eq!(cable_instance_id(255, "VCABLE-255"), "USB\\VID_FFFF&PID_CBFF\\VCABLE-255");
     }
 
     #[test]

@@ -8,7 +8,7 @@ The USB/IP transport is provided by [usbip-win2](https://github.com/vadimgrn/usb
 
 - Up to 32 independent virtual audio cables
 - A playback and a recording endpoint for every cable
-- Standard USB Audio Class 1.0 devices, handled by Windows' built-in USB audio driver
+- Standard USB Audio Class 2.0 devices, handled by Windows' built-in USB Audio 2.0 driver
 - No emulation of proprietary audio hardware
 - Add or remove cables from the application
 - Bit-exact pass-through with a fixed latency on every cable
@@ -23,6 +23,8 @@ The application runs a local USB/IP server that exports each cable as a USB audi
 
 Audio played to the playback side comes out of the recording side of the same cable, bit for bit, a fixed `latency_ms` later. Both sides run on the same 1 ms USB frame clock that Windows uses, so there is no clock drift to correct: each millisecond of playback audio is stored under its frame number, and the recording side returns the audio of the frame `latency_ms` earlier. If audio for a frame never arrives, only that frame is silent. Volume and mute on either side apply on the way through, and at 100% the audio is untouched.
 
+Each cable is a USB Audio Class 2.0 device, so Windows uses its in-box USB Audio 2.0 driver (`usbaudio2.sys`). That driver refills playback from the audio engine's shared buffer as each transfer completes, so system load does not interrupt it. Windows' older USB Audio 1.0 driver depends on the audio engine for every buffer: under load it stops sending for tens of milliseconds and can fall into resetting the stream after every transfer, which sounds robotic.
+
 This is different from conventional virtual audio cables, which depend on a dedicated kernel-mode audio driver.
 
 ## Audio format
@@ -33,11 +35,11 @@ Every cable uses a fixed format:
 - Stereo
 - 24-bit PCM
 
-The USB Audio Class descriptors and isochronous endpoint sizes are configured for packed 24-bit PCM. This does not update or repair the separate usbip-win2 kernel driver.
+The USB Audio Class 2.0 descriptors declare one fixed 48 kHz clock and synchronous isochronous endpoints of one 48-frame packet per 1 ms frame, so neither side needs a feedback endpoint. This does not update or repair the separate usbip-win2 kernel driver.
 
 ## Requirements
 
-- Windows 10 or Windows 11
+- Windows 10 version 1703 or later, or Windows 11, for the in-box USB Audio 2.0 driver
 - x64 processor
 - The usbip-win2 transport driver
 - Administrator approval when the cables are attached to Windows
@@ -63,9 +65,9 @@ listen = "127.0.0.1:3240"
 # Delay between each cable's playback and recording sides, 1-1000 ms.
 # Playback that Windows sends later than this plays after a short gap.
 latency_ms = 40
-# When playback transfers complete: "start" of their first frame, which gives
-# Windows time to send the next one, or "end" of their last, as USB hardware does.
-playback_completion = "start"
+# When playback transfers complete: "end" of their last frame, as USB hardware
+# does, or "start" of their first, which gives Windows more time to send the next.
+playback_completion = "end"
 # Detailed USB/IP traces in the log, for troubleshooting.
 diagnostics = false
 # For troubleshooting: hold all audio transfers this many milliseconds once a
@@ -82,10 +84,10 @@ name = "Game audio"
 |---|---|---|
 | `listen` | Address of the local USB/IP server. | `"127.0.0.1:3240"` |
 | `latency_ms` | Delay between each cable's playback and recording sides, 1-1000 ms. Windows sends playback about 10 ms ahead, so any value works while streaming normally; the latency is how late, after a system stall, playback can still arrive and play on time. If it arrives later still, the cable moves the rest of that stream later, leaving a short gap, and moves it back, skipping the audio in between, once Windows catches up. | `40` |
-| `playback_completion` | When playback transfers are reported complete: `"start"` of their first frame, or `"end"` of their last, as USB hardware does. Windows sends each playback transfer about 1 ms after an earlier one completes, keeping one to three queued, and resets the stream whenever a completion leaves nothing queued. `"start"` gives it a transfer's length more to send the next, but only while another transfer is queued behind: one with nothing behind it completes at its end, so a lone transfer never leaves the queue empty early. The audio plays at the same time either way. | `"start"` |
+| `playback_completion` | When playback transfers are reported complete: `"end"` of their last frame, as USB hardware does, or `"start"` of their first, while another transfer is queued behind it. `"start"` was a workaround for Windows' USB Audio 1.0 driver, which sends each playback transfer only after an earlier one completes and resets the stream whenever a completion leaves nothing queued; the cables now use the USB Audio 2.0 driver. The audio plays at the same time either way. | `"end"` |
 | `diagnostics` | Detailed USB/IP traces in the log, for troubleshooting (`true` or `false`). | `false` |
 | `stall_test_ms` | For troubleshooting: hold every audio transfer of every cable this many milliseconds once a minute, starting a minute after start-up, to reproduce a system stall on demand. 0-10000; 0 turns it off. | `0` |
-| `[[cable]]` | One table per cable, up to 32, in list order. `serial` is created with the cable and is its identity in Windows, so a new cable is always a new device there with its own name, and an existing one keeps its settings after a restart. `id` (1-255) sets the USB product ID (`FFFF:CAxx`) and bus ID (`1-<id>`). `name` is what Windows Sound shows. The application rewrites these tables when cables are added or removed, and removing a cable also deletes its devices from Windows. | none |
+| `[[cable]]` | One table per cable, up to 32, in list order. `serial` is created with the cable and is its identity in Windows, so a new cable is always a new device there with its own name, and an existing one keeps its settings after a restart. `id` (1-255) sets the USB product ID (`FFFF:CBxx`) and bus ID (`1-<id>`). `name` is what Windows Sound shows. The application rewrites these tables when cables are added or removed, and removing a cable also deletes its devices from Windows. | none |
 
 Invalid values fall back to the default, and the log says so. The application only ever rewrites the `[[cable]]` tables, so comments and edits elsewhere in the file are kept. If the file is not valid TOML, the application starts with the default settings and no cables, logs the error, and does not overwrite the file until it is fixed.
 
@@ -117,7 +119,7 @@ The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at ea
   - `playback_resyncs`, `capture_resyncs` and `halt_clears`: stream restarts, and stream resets by Windows.
   - `late_packets`: playback packets Windows sent for frames that had already begun, which are reported back as not sent, as a USB controller does. Their audio still plays.
 
-  `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly; make sure `playback_completion` is `"start"`. `stall_test_ms = 30` reproduces the stall that can start such a loop once a minute, so settings can be tried quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
+  `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly; this happened with the USB Audio 1.0 driver, which the cables no longer use; `playback_completion = "start"` may help if it appears. `stall_test_ms = 30` reproduces the stall that can start such a loop once a minute, so settings can be tried quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
 
   For more detail, set `diagnostics = true`, restart, and reproduce the problem. Each logged `HALT CLEAR` (Windows resetting a stream) is then preceded by `ISO TRACE ... before` lines for the last transfers on that endpoint, and followed by `ISO TRACE ... after` lines for the next ones, with their bus frames and timing.
 - **No devices in Windows Sound:** check that usbip-win2 is installed and that the administrator prompt was approved. The `usbip.exe` lines in the log show the attach steps and any errors.
@@ -158,7 +160,7 @@ Open the project folder in RustRover. Shared run configurations are in `.run/` a
 | `src/main.rs` | Startup, the log, and the server lifecycle |
 | `src/cli.rs` | Command-line options |
 | `src/config.rs` | `config.toml` |
-| `src/uac1.rs` | The USB Audio Class 1.0 device: descriptors and control requests |
+| `src/uac2.rs` | The USB Audio Class 2.0 device: descriptors and control requests |
 | `src/audio.rs` | The delay line, addressed by USB frame, between playback and recording |
 | `src/usbip/` | The USB/IP protocol, the server, and the USB frame clock |
 | `src/platform/windows/` | The window, the administrator helper, `usbip.exe` attachment and the driver download |

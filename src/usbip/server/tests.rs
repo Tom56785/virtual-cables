@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::audio::LineStatus;
-use crate::uac1::{
+use crate::uac2::{
     DEFAULT_LATENCY_MS, Device, REQUEST_CLEAR_FEATURE, REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE,
 };
 use crate::usbip::busclock::TICKS_PER_FRAME;

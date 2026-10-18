@@ -12,7 +12,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::logf;
 use crate::logging::Logger;
-use crate::uac1::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
+use crate::uac2::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
 
 pub const MAX_CABLES: usize = 32;
 /// Cable IDs fit the USB product IDs 0xCA01-0xCAFF.
@@ -253,9 +253,9 @@ pub fn default_config_content() -> String {
         format!("# Delay between each cable's playback and recording sides, {MIN_LATENCY_MS}-{MAX_LATENCY_MS} ms."),
         "# Playback that Windows sends later than this plays after a short gap.".to_string(),
         format!("latency_ms = {DEFAULT_LATENCY_MS}"),
-        "# When playback transfers complete: \"start\" of their first frame, which gives".to_string(),
-        "# Windows time to send the next one, or \"end\" of their last, as USB hardware does.".to_string(),
-        "playback_completion = \"start\"".to_string(),
+        "# When playback transfers complete: \"end\" of their last frame, as USB hardware".to_string(),
+        "# does, or \"start\" of their first, which gives Windows more time to send the next.".to_string(),
+        "playback_completion = \"end\"".to_string(),
         "# Detailed USB/IP traces in the log, for troubleshooting.".to_string(),
         "diagnostics = false".to_string(),
         "# For troubleshooting: hold all audio transfers this many milliseconds once a".to_string(),
@@ -400,7 +400,7 @@ pub(crate) mod tests {
         let config = parse_config(&written).unwrap();
         assert_eq!(config_string(&config, "listen", ""), DEFAULT_LISTEN);
         assert_eq!(config_int(&config, "latency_ms", 0), DEFAULT_LATENCY_MS);
-        assert_eq!(config_string(&config, "playback_completion", ""), "start");
+        assert_eq!(config_string(&config, "playback_completion", ""), "end");
         assert_eq!(config_int(&config, "stall_test_ms", 1), 0);
         assert!(!config_bool(&config, "diagnostics", true));
         assert_eq!(config_cables(&config), []);

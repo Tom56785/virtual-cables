@@ -14,7 +14,7 @@ use super::protocol::*;
 use crate::event::Event;
 use crate::logf;
 use crate::logging::Logger;
-use crate::uac1::{self, Device, SetupPacket};
+use crate::uac2::{self, Device, SetupPacket};
 
 const MAX_TRANSFER_LENGTH: u32 = 16 * 1024 * 1024;
 
@@ -67,22 +67,24 @@ pub struct Server {
 
 /// When a playback URB is reported complete.
 ///
-/// usbaudio sends each playback URB about a millisecond after an earlier one
-/// completes, keeping one to three queued. Whenever a completion leaves it
-/// nothing queued, it resets the pipe and sends a single URB; it only
-/// recovers when it has more audio ready by then. With one URB in flight,
-/// every completion leaves nothing queued, so after a stall it can keep
-/// resetting the pipe after every URB.
+/// usbaudio.sys, Windows' UAC1 driver, sends each playback URB about a
+/// millisecond after an earlier one completes, keeping one to three queued,
+/// and resets the pipe whenever a completion leaves it nothing queued. Under
+/// load it stops sending for tens of milliseconds, and after a reset it can
+/// keep resetting the pipe after every URB. The cables are UAC2 devices,
+/// served by usbaudio2.sys, which refills a URB within a fraction of a
+/// millisecond of each completion, so they complete URBs as a host
+/// controller does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlaybackCompletion {
     /// When its last frame has ended, as USB host controllers do.
+    #[default]
     End,
     /// When its first frame begins, as long as another URB is queued behind
-    /// it, which gives usbaudio a URB's length more time to send the next;
+    /// it, which gives the driver a URB's length more time to send the next;
     /// otherwise when its last frame ends, or as soon as another URB arrives.
     /// Its audio is already in the delay line and plays at its frames either
     /// way.
-    #[default]
     Start,
 }
 
@@ -302,9 +304,9 @@ impl Server {
             append_usb_device(&mut b, d);
             // The devlist reply contains one class/subclass/protocol tuple for
             // every interface in the active configuration, not one per alt setting.
-            b.extend_from_slice(&[0x01, 0x01, 0x00, 0]); // AudioControl
-            b.extend_from_slice(&[0x01, 0x02, 0x00, 0]); // AudioStreaming playback
-            b.extend_from_slice(&[0x01, 0x02, 0x00, 0]); // AudioStreaming capture
+            b.extend_from_slice(&[0x01, 0x01, 0x20, 0]); // AudioControl, UAC2
+            b.extend_from_slice(&[0x01, 0x02, 0x20, 0]); // AudioStreaming playback
+            b.extend_from_slice(&[0x01, 0x02, 0x20, 0]); // AudioStreaming capture
         }
         b
     }
@@ -482,7 +484,7 @@ impl Server {
         let req = submit.req;
 
         if req.basic.endpoint == 0 {
-            let setup = match uac1::parse_setup(&req.setup) {
+            let setup = match uac2::parse_setup(&req.setup) {
                 Ok(setup) => setup,
                 Err(_) => return state.write_submit(submit, STATUS_INVALID, 0, &[], &[], 0),
             };
@@ -725,7 +727,7 @@ impl Server {
         if req.basic.endpoint == 0 {
             let count = self.control_count.fetch_add(1, Ordering::SeqCst) + 1;
             if count <= 20 || count.is_multiple_of(500) {
-                let setup = uac1::parse_setup(&req.setup).unwrap_or_default();
+                let setup = uac2::parse_setup(&req.setup).unwrap_or_default();
                 logf!(
                     self.logger,
                     "{} CTRL #{count} seq={} dir={} {}",
@@ -1362,7 +1364,7 @@ impl WorkerShared {
 }
 
 pub(crate) fn is_endpoint_halt_clear(setup: &SetupPacket) -> bool {
-    setup.request_type == 0x02 && setup.request == uac1::REQUEST_CLEAR_FEATURE && setup.value == 0
+    setup.request_type == 0x02 && setup.request == uac2::REQUEST_CLEAR_FEATURE && setup.value == 0
 }
 
 /// How many CLEAR_FEATURE(ENDPOINT_HALT) requests are logged in full after a
@@ -1377,8 +1379,8 @@ const HALT_BURST_LINES: u64 = 30;
 pub(crate) fn reset_timelines_after_control(state: &ConnState, setup: &SetupPacket, now: BusTime) {
     if is_endpoint_halt_clear(setup) {
         state.clear_endpoint_halt((setup.index & 0x0f) as u32, now);
-    } else if (setup.request_type == 0x01 && setup.request == uac1::REQUEST_SET_INTERFACE)
-        || (setup.request_type == 0x00 && setup.request == uac1::REQUEST_SET_CONFIGURATION)
+    } else if (setup.request_type == 0x01 && setup.request == uac2::REQUEST_SET_INTERFACE)
+        || (setup.request_type == 0x00 && setup.request == uac2::REQUEST_SET_CONFIGURATION)
     {
         state.reset_idle_iso_timelines();
     }

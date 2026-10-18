@@ -10,7 +10,7 @@ mod config;
 mod event;
 mod logging;
 mod platform;
-mod uac1;
+mod uac2;
 mod usbip;
 
 use std::env;
@@ -28,7 +28,7 @@ use crate::config::{
     ensure_config_file, load_config_content, numbered_cables, parse_config,
 };
 use crate::logging::{AsyncWriter, Logger, flush_log, set_app_log_writer};
-use crate::uac1::{DEFAULT_LATENCY_MS, Device, MAX_LATENCY_MS, MIN_LATENCY_MS, bus_id};
+use crate::uac2::{DEFAULT_LATENCY_MS, Device, MAX_LATENCY_MS, MIN_LATENCY_MS, bus_id};
 use crate::usbip::Server;
 use crate::usbip::server::PlaybackCompletion;
 
@@ -393,7 +393,7 @@ pub fn make_devices(cables: &[Cable], latency_ms: i64) -> Result<Vec<Arc<Device>
 
 fn run_self_test(devices: &[Arc<Device>]) -> Result<(), String> {
     use crate::audio::PACKET_BYTES;
-    use crate::uac1::{REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE, SetupPacket};
+    use crate::uac2::{REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE, SetupPacket};
     for dev in devices {
         dev.descriptors.validate().map_err(|err| format!("{}: {err}", dev.product()))?;
         let (_, status) =
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!((devices[0].bus_id.as_str(), devices[0].product()), ("1-7", "Game"));
         assert_eq!(devices[0].descriptors.serial, "8F3A2C1D");
         // The product ID follows the cable ID.
-        assert_eq!(&devices[0].descriptors.device[10..12], &0xCA07u16.to_le_bytes());
+        assert_eq!(&devices[0].descriptors.device[10..12], &0xCB07u16.to_le_bytes());
     }
 
     #[test]

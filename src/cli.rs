@@ -25,7 +25,7 @@ pub struct Cli {
     #[arg(long, value_name = "MS")]
     pub latency_ms: Option<i64>,
 
-    /// When playback transfers complete: start (of their first frame) or end (of their last) [config.toml: playback_completion, default start]
+    /// When playback transfers complete: end (of their last frame) or start (of their first) [config.toml: playback_completion, default end]
     #[arg(long, value_name = "WHEN", value_parser = parse_playback_completion)]
     pub playback_completion: Option<PlaybackCompletion>,
 
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn help_shows_the_real_defaults() {
         use crate::config::DEFAULT_LISTEN;
-        use crate::uac1::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
+        use crate::uac2::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
         let help = Cli::command().render_help().to_string();
         for expected in [
             format!("default {DEFAULT_LISTEN}"),
