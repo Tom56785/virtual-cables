@@ -66,32 +66,19 @@ fn iso_completions_are_serialized_per_endpoint() {
     assert_eq!(other_endpoint.start_frame, 1001, "independent endpoint");
 }
 
-/// A URB whose slot has passed starts on the next bus frame, never in the past.
 #[test]
-fn late_iso_submit_starts_on_next_frame() {
+fn late_iso_submit_stays_contiguous() {
     let state = discard_state();
     state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
-    state.add_pending(1, 1, token());
 
-    // Its slot is still ahead: the stream stays contiguous.
-    let on_time = state.reserve_iso_completion(1, 10, test_bus_time(1010));
-    assert_eq!((on_time.start_frame, on_time.resynced), (1011, false));
+    // Submitted 190 frames after the previous URB ended: keep the stream
+    // position and complete as soon as possible.
+    let late = state.reserve_iso_completion(1, 10, test_bus_time(1200));
+    assert_eq!((late.start_frame, late.resynced), (1011, false));
 
-    // Frame 1021 has begun, so the slot after the queue has expired.
-    let now = test_bus_time(1021);
-    let late = state.reserve_iso_completion(1, 10, now);
-    assert_eq!((late.start_frame, late.resynced), (1022, true));
-    assert_eq!(late.deadline.unwrap() - now.wall, Duration::from_millis(11));
-}
-
-/// With nothing queued, the previous stream has ended: the next URB starts a
-/// new one on the next bus frame.
-#[test]
-fn iso_submit_after_idle_starts_new_stream() {
-    let state = discard_state();
-    state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
-    let next = state.reserve_iso_completion(1, 10, test_bus_time(1012));
-    assert_eq!((next.start_frame, next.resynced), (1013, false));
+    // Far behind: the stream stopped, so restart on the next bus frame.
+    let stalled = state.reserve_iso_completion(1, 10, test_bus_time(5000));
+    assert_eq!((stalled.start_frame, stalled.resynced), (5001, true));
 }
 
 #[test]
@@ -106,7 +93,7 @@ fn unlinked_urb_gets_only_ret_unlink() {
     submit.tracked = true;
     state.add_pending(7, 1, token());
 
-    let (found, result) = state.unlink(&BasicHeader { sequence: 8, ..Default::default() }, 7);
+    let (found, result) = state.unlink(&BasicHeader { sequence: 8, ..Default::default() }, 7, test_bus_time(1000));
     result.unwrap();
     assert!(found);
     let unlink_reply = out.bytes().len();
@@ -117,7 +104,7 @@ fn unlinked_urb_gets_only_ret_unlink() {
     assert_eq!(be32(&wire, 20) as i32, STATUS_CONN_RESET);
 
     // Unlinking an already completed URB succeeds with status 0.
-    let (found, _) = state.unlink(&BasicHeader { sequence: 9, ..Default::default() }, 7);
+    let (found, _) = state.unlink(&BasicHeader { sequence: 9, ..Default::default() }, 7, test_bus_time(1000));
     assert!(!found, "completed URB reported as pending");
 }
 
@@ -130,7 +117,7 @@ fn unlink_resets_idle_iso_timeline() {
         state.add_pending(seq, 1, token());
     }
     for seq in 1..=4 {
-        state.unlink(&BasicHeader { sequence: 100 + seq, ..Default::default() }, seq).1.unwrap();
+        state.unlink(&BasicHeader { sequence: 100 + seq, ..Default::default() }, seq, now).1.unwrap();
     }
     // The aborted URBs reserved 40 frames; the restarted stream must not wait for it.
     assert_eq!(state.reserve_iso_completion(1, 10, now).start_frame, 1001);
@@ -142,21 +129,32 @@ fn clear_halt_resets_iso_timeline() {
     let now = test_bus_time(1000);
     state.reserve_iso_completion(1, 10, now);
     state.reserve_iso_completion(1, 10, now);
-    reset_timelines_after_control(&state, &CLEAR_HALT);
+    reset_timelines_after_control(&state, &CLEAR_HALT, now);
     assert_eq!(state.reserve_iso_completion(1, 10, now).start_frame, 1001);
 }
 
-/// The first ASAP transfer after a pipe reset begins on the next frame, as
-/// the Windows USB stack documents, even right after the previous one ended:
-/// it must never be reported as starting before it was submitted.
+/// After a stall, usbaudio can reset the pipe after every URB with one URB in
+/// flight. The schedule must still advance one frame per frame, or playback
+/// runs slower than real time and capture underruns permanently.
 #[test]
-fn clear_halt_restarts_on_next_frame() {
+fn clear_halt_after_each_urb_keeps_real_time() {
     let state = discard_state();
-    let slot = state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
-    // The URB completes, the host clears the halt and resubmits 2 frames later.
-    reset_timelines_after_control(&state, &CLEAR_HALT);
-    let next = state.reserve_iso_completion(1, 10, test_bus_time(slot.end_frame + 2));
-    assert_eq!((next.start_frame as u64, next.resynced), (slot.end_frame + 3, false));
+    let mut slot = state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
+    for i in 0..100 {
+        // The URB completes, the host clears the halt and resubmits 2 frames later.
+        reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(slot.end_frame + 1));
+        let next = state.reserve_iso_completion(1, 10, test_bus_time(slot.end_frame + 2));
+        assert_eq!(next.start_frame as u64, slot.end_frame, "URB {i} not contiguous");
+        slot = next;
+    }
+}
+
+#[test]
+fn clear_halt_restarts_stale_iso_timeline() {
+    let state = discard_state();
+    state.reserve_iso_completion(1, 10, test_bus_time(1000)); // frames 1001-1010
+    reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(1100));
+    assert_eq!(state.reserve_iso_completion(1, 10, test_bus_time(1100)).start_frame, 1101);
 }
 
 #[test]
@@ -166,7 +164,7 @@ fn set_interface_restarts_idle_iso_timeline() {
     state.reserve_iso_completion(1, 10, now);
     let set_interface =
         SetupPacket { request_type: 0x01, request: REQUEST_SET_INTERFACE, value: 1, index: 1, length: 0 };
-    reset_timelines_after_control(&state, &set_interface);
+    reset_timelines_after_control(&state, &set_interface, test_bus_time(1003));
     assert_eq!(state.reserve_iso_completion(1, 10, test_bus_time(1003)).start_frame, 1004);
 }
 
@@ -194,10 +192,54 @@ fn diagnostic_traces_follow_setting() {
         let mut s = Server::new("", Vec::new(), logger);
         s.diagnostics = enabled;
         s.trace_submit(&dev, &submit);
-        s.trace_endpoint_halt(&dev, &discard_state(), &CLEAR_HALT, test_bus_time(1000));
+        let state = discard_state();
+        let done = IsoEvent::Done { seq: 1, bus_us: 0, end: 0, queued: 0, cancelled: false };
+        s.trace_iso_event(&dev, &state, 1, done);
+        s.trace_endpoint_halt(&dev, &state, &CLEAR_HALT, test_bus_time(1000));
         let logged = !out.lock().unwrap().is_empty();
         assert_eq!(logged, enabled, "diagnostics={enabled}");
     }
+}
+
+/// URB events are logged only around a logged pipe reset: the recent ones
+/// before it, then the next ones as they happen.
+#[test]
+fn iso_trace_surrounds_logged_pipe_reset() {
+    let dev = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+    let state = discard_state();
+    let (logger, out) = Logger::memory();
+    let mut s = Server::new("", Vec::new(), logger);
+    s.diagnostics = true;
+    let lines = || String::from_utf8(out.lock().unwrap().clone()).unwrap();
+    let submit = |seq| IsoEvent::Submit {
+        seq,
+        packets: 10,
+        frame: 1000,
+        bus_us: 1_000_000,
+        start_frame: 1001,
+        end: 1011,
+        in_flight: 0,
+    };
+
+    for seq in 1..=10 {
+        s.trace_iso_event(&dev, &state, 1, submit(seq));
+    }
+    assert_eq!(lines(), "", "traced without a pipe reset");
+
+    s.trace_endpoint_halt(&dev, &state, &CLEAR_HALT, test_bus_time(1012));
+    let logged = lines();
+    assert!(!logged.contains("seq=2 "), "kept more than the recent history: {logged}");
+    assert!(logged.contains("1-1 ISO TRACE ep=1 before submit seq=3 bus_us=1000000 frame=1000"), "{logged}");
+    assert!(logged.contains("start_frame=1001 end_frame=1011 lead_frames=1 in_flight=0"), "{logged}");
+    assert!(logged.contains("HALT CLEAR #1 ep=1") && logged.contains("bus_us=1012000"), "{logged}");
+
+    let done = IsoEvent::Done { seq: 11, bus_us: 1_011_200, end: 1011, queued: 0, cancelled: false };
+    s.trace_iso_event(&dev, &state, 1, done);
+    let logged = lines();
+    assert!(
+        logged.contains("1-1 ISO TRACE ep=1 after done seq=11 bus_us=1011200 end_frame=1011 after_end_us=200 queued=0"),
+        "{logged}"
+    );
 }
 
 /// The audio health report is always on, logs only changes since the last
@@ -217,10 +259,8 @@ fn audio_health_reports_changes() {
     assert_eq!(lines(), "", "logged without a change");
 
     state.reserve_iso_completion(1, 10, test_bus_time(1000));
-    state.add_pending(1, 1, token());
     state.reserve_iso_completion(1, 10, test_bus_time(5000)); // too late: resynced
-    state.unlink(&BasicHeader { sequence: 2, ..Default::default() }, 1).1.unwrap();
-    reset_timelines_after_control(&state, &CLEAR_HALT);
+    reset_timelines_after_control(&state, &CLEAR_HALT, test_bus_time(5000));
     s.report_audio_health(&state, &device);
     assert_eq!(lines(), "", "logged again within the interval");
     allow_check();
