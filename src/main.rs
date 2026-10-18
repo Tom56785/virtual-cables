@@ -30,7 +30,6 @@ use crate::config::{
 use crate::logging::{AsyncWriter, Logger, flush_log, set_app_log_writer};
 use crate::uac2::{DEFAULT_LATENCY_MS, Device, MAX_LATENCY_MS, MIN_LATENCY_MS, bus_id};
 use crate::usbip::Server;
-use crate::usbip::server::PlaybackCompletion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -40,7 +39,6 @@ pub struct AppServer {
     address: String,
     /// The delay between each cable's playback and recording sides.
     latency_ms: i64,
-    playback_completion: PlaybackCompletion,
     /// For troubleshooting: how long to hold all transfers once a minute.
     stall_test: Option<Duration>,
     /// Enables the USB/IP stream traces in the log.
@@ -74,7 +72,6 @@ impl AppServer {
         };
         let mut server = Server::new(self.address.clone(), devices, self.logger.clone());
         server.diagnostics = self.diagnostics;
-        server.playback_completion = self.playback_completion;
         server.stall_test = self.stall_test;
         let server = Arc::new(server);
         let (ready_tx, ready) = mpsc::channel();
@@ -248,7 +245,7 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
         Config::default()
     });
     let cables = startup_cables(cli.cables, &config, logger);
-    let (latency_ms, playback_completion, stall_test) = audio_settings(&cli, &config, logger);
+    let (latency_ms, stall_test) = audio_settings(&cli, &config, logger);
     let diagnostics = cli.diagnostics.unwrap_or_else(|| config_bool(&config, "diagnostics", false));
     let listen = cli.listen.clone().unwrap_or_else(|| config_string(&config, "listen", DEFAULT_LISTEN));
     logf!(logger, "Diagnostic logging: {diagnostics}");
@@ -296,7 +293,6 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
         inner: Mutex::new(AppInner { server: None, done: None, cables: cables.clone(), last_error: String::new() }),
         address: listen,
         latency_ms,
-        playback_completion,
         stall_test,
         diagnostics,
         logger: logger.clone(),
@@ -330,7 +326,7 @@ const MAX_STALL_TEST_MS: i64 = 10_000;
 
 /// The audio settings, from the command line, config.toml or the defaults,
 /// with invalid values replaced by the defaults and logged.
-fn audio_settings(cli: &Cli, config: &Config, logger: &Logger) -> (i64, PlaybackCompletion, Option<Duration>) {
+fn audio_settings(cli: &Cli, config: &Config, logger: &Logger) -> (i64, Option<Duration>) {
     let mut latency_ms = cli.latency_ms.unwrap_or_else(|| config_int(config, "latency_ms", DEFAULT_LATENCY_MS));
     if !(MIN_LATENCY_MS..=MAX_LATENCY_MS).contains(&latency_ms) {
         logf!(
@@ -340,15 +336,6 @@ fn audio_settings(cli: &Cli, config: &Config, logger: &Logger) -> (i64, Playback
         latency_ms = DEFAULT_LATENCY_MS;
     }
 
-    let playback_completion = cli.playback_completion.unwrap_or_else(|| {
-        let text = config_string(config, "playback_completion", PlaybackCompletion::default().name());
-        PlaybackCompletion::parse(&text).unwrap_or_else(|| {
-            let fallback = PlaybackCompletion::default().name();
-            logf!(logger, "Invalid playback_completion {text:?} (must be \"start\" or \"end\"); using \"{fallback}\"");
-            PlaybackCompletion::default()
-        })
-    });
-
     let mut stall_test_ms = cli.stall_test_ms.unwrap_or_else(|| config_int(config, "stall_test_ms", 0));
     if !(0..=MAX_STALL_TEST_MS).contains(&stall_test_ms) {
         logf!(logger, "Invalid stall test {stall_test_ms} ms (must be 0-{MAX_STALL_TEST_MS} ms); turning it off");
@@ -356,15 +343,11 @@ fn audio_settings(cli: &Cli, config: &Config, logger: &Logger) -> (i64, Playback
     }
     let stall_test = (stall_test_ms > 0).then(|| Duration::from_millis(stall_test_ms as u64));
 
-    logf!(
-        logger,
-        "Audio: {latency_ms} ms latency; playback transfers complete at their {}",
-        playback_completion.name()
-    );
+    logf!(logger, "Audio: {latency_ms} ms latency");
     if stall_test.is_some() {
         logf!(logger, "Stall test: holding audio transfers for {stall_test_ms} ms every minute");
     }
-    (latency_ms, playback_completion, stall_test)
+    (latency_ms, stall_test)
 }
 
 /// The cables to start with: cables 1 to N for --cables N, otherwise the
@@ -631,7 +614,6 @@ mod tests {
             inner: Mutex::new(AppInner { server: None, done: None, cables: Vec::new(), last_error: String::new() }),
             address: "127.0.0.1:0".into(),
             latency_ms: DEFAULT_LATENCY_MS,
-            playback_completion: PlaybackCompletion::End,
             stall_test: None,
             diagnostics: false,
             logger: Logger::discard(),

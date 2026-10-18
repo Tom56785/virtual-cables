@@ -65,9 +65,6 @@ listen = "127.0.0.1:3240"
 # Delay between each cable's playback and recording sides, 1-1000 ms.
 # Playback that Windows sends later than this plays after a short gap.
 latency_ms = 40
-# When playback transfers complete: "end" of their last frame, as USB hardware
-# does, or "start" of their first, which gives Windows more time to send the next.
-playback_completion = "end"
 # Detailed USB/IP traces in the log, for troubleshooting.
 diagnostics = false
 # For troubleshooting: hold all audio transfers this many milliseconds once a
@@ -84,7 +81,6 @@ name = "Game audio"
 |---|---|---|
 | `listen` | Address of the local USB/IP server. | `"127.0.0.1:3240"` |
 | `latency_ms` | Delay between each cable's playback and recording sides, 1-1000 ms. Windows sends playback about 10 ms ahead, so any value works while streaming normally; the latency is how late, after a system stall, playback can still arrive and play on time. If it arrives later still, the cable moves the rest of that stream later, leaving a short gap, and moves it back, skipping the audio in between, once Windows catches up. | `40` |
-| `playback_completion` | When playback transfers are reported complete: `"end"` of their last frame, as USB hardware does, or `"start"` of their first, while another transfer is queued behind it. `"start"` was a workaround for Windows' USB Audio 1.0 driver, which sends each playback transfer only after an earlier one completes and resets the stream whenever a completion leaves nothing queued; the cables now use the USB Audio 2.0 driver. The audio plays at the same time either way. | `"end"` |
 | `diagnostics` | Detailed USB/IP traces in the log, for troubleshooting (`true` or `false`). | `false` |
 | `stall_test_ms` | For troubleshooting: hold every audio transfer of every cable this many milliseconds once a minute, starting a minute after start-up, to reproduce a system stall on demand. 0-10000; 0 turns it off. | `0` |
 | `[[cable]]` | One table per cable, up to 32, in list order. `serial` is created with the cable and is its identity in Windows, so a new cable is always a new device there with its own name, and an existing one keeps its settings after a restart. `id` (1-255) sets the USB product ID (`FFFF:CBxx`) and bus ID (`1-<id>`). `name` is what Windows Sound shows. The application rewrites these tables when cables are added or removed, and removing a cable also deletes its devices from Windows. | none |
@@ -96,7 +92,7 @@ Invalid values fall back to the default, and the log says so. The application on
 Every setting can also be given on the command line, which overrides `config.toml` for that run:
 
 ```
-VirtualCables.exe [--cables <COUNT>] [--listen <ADDRESS>] [--latency-ms <MS>] [--playback-completion <WHEN>] [--diagnostics [<BOOL>]] [--stall-test-ms <MS>]
+VirtualCables.exe [--cables <COUNT>] [--listen <ADDRESS>] [--latency-ms <MS>] [--diagnostics [<BOOL>]] [--stall-test-ms <MS>]
 ```
 
 | Option | Action |
@@ -119,7 +115,7 @@ The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at ea
   - `playback_resyncs`, `capture_resyncs` and `halt_clears`: stream restarts, and stream resets by Windows.
   - `late_packets`: playback packets Windows sent for frames that had already begun, which are reported back as not sent, as a USB controller does. Their audio still plays.
 
-  `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly; this happened with the USB Audio 1.0 driver, which the cables no longer use; `playback_completion = "start"` may help if it appears. `stall_test_ms = 30` reproduces the stall that can start such a loop once a minute, so settings can be tried quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
+  `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly. This happened with the USB Audio 1.0 driver, which the cables no longer use. `stall_test_ms = 30` reproduces a system stall once a minute, so recovery can be checked quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
 
   For more detail, set `diagnostics = true`, restart, and reproduce the problem. Each logged `HALT CLEAR` (Windows resetting a stream) is then preceded by `ISO TRACE ... before` lines for the last transfers on that endpoint, and followed by `ISO TRACE ... after` lines for the next ones, with their bus frames and timing.
 - **No devices in Windows Sound:** check that usbip-win2 is installed and that the administrator prompt was approved. The `usbip.exe` lines in the log show the attach steps and any errors.

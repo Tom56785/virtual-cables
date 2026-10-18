@@ -350,11 +350,7 @@ fn socket_pair() -> (TcpStream, TcpStream) {
 }
 
 fn start_session(device: Arc<Device>, server_side: TcpStream) -> std::thread::JoinHandle<()> {
-    start_session_with(Server::new("", vec![Arc::clone(&device)], Logger::discard()), device, server_side)
-}
-
-fn start_session_with(server: Server, device: Arc<Device>, server_side: TcpStream) -> std::thread::JoinHandle<()> {
-    let server = Arc::new(server);
+    let server = Arc::new(Server::new("", vec![Arc::clone(&device)], Logger::discard()));
     std::thread::spawn(move || {
         let reader = ConnReader::new(server_side.try_clone().unwrap(), 64 * 1024);
         server.handle_urbs(reader, Box::new(server_side), device);
@@ -511,44 +507,8 @@ fn streaming_loops_audio_back_unchanged() {
     session.join().unwrap();
 }
 
-/// Sends playback URBs of the given packet counts back to back, and returns
-/// how long the first took to complete, in ms.
-fn first_playback_completion_ms(completion: PlaybackCompletion, urbs: &[u32]) -> u64 {
-    let device = active_device(DEFAULT_LATENCY_MS);
-    let (mut host, server_side) = socket_pair();
-    let mut server = Server::new("", vec![Arc::clone(&device)], Logger::discard());
-    server.playback_completion = completion;
-    let session = start_session_with(server, Arc::clone(&device), server_side);
-    let started = Instant::now();
-    for (seq, &packets) in (1..).zip(urbs) {
-        host.write_all(&iso_submit(seq, DIRECTION_OUT, 1, packets)).unwrap();
-    }
-    let reply = read_reply(&mut host, |_| 0).unwrap();
-    let took = started.elapsed().as_millis() as u64;
-    assert_eq!((reply.command, reply.seq, reply.status), (RET_SUBMIT, 1, 0), "{completion:?}");
-    host.shutdown(std::net::Shutdown::Both).unwrap();
-    session.join().unwrap();
-    took
-}
-
-/// With `PlaybackCompletion::Start`, a playback URB completes when its first
-/// frame begins, but only while another URB is queued behind it; one with
-/// nothing behind it completes after its last frame, as with `End`.
-#[test]
-fn playback_completes_at_its_first_frame_only_with_another_queued() {
-    // 255 packets: completing after the last frame takes a quarter second.
-    let took = first_playback_completion_ms(PlaybackCompletion::Start, &[255, 10]);
-    assert!(took <= 60, "with a URB queued behind, completed after {took} ms");
-    let took = first_playback_completion_ms(PlaybackCompletion::Start, &[255]);
-    assert!(took >= 250, "with nothing queued behind, completed after only {took} ms");
-    let took = first_playback_completion_ms(PlaybackCompletion::End, &[255, 10]);
-    assert!(took >= 250, "completed at the end after only {took} ms");
-}
-
-/// After a pipe reset, usbaudio sends one playback URB, and resets the pipe
-/// again whenever a completion leaves nothing queued. A host that sends one
-/// URB at a time must therefore still see each complete after its last
-/// frame: completed at its first, usbaudio reset the pipe every 2 ms.
+/// A playback URB completes after its last frame, as a host controller
+/// completes it, even when nothing is queued behind it.
 #[test]
 fn one_playback_urb_at_a_time_completes_after_its_last_frame() {
     let device = active_device(DEFAULT_LATENCY_MS);

@@ -41,8 +41,6 @@ pub struct Server {
     /// Enables the per-URB stream traces and the pipe-reset, unlink and resync
     /// events in the log. Set it before `serve`.
     pub diagnostics: bool,
-    /// When playback URBs complete. Set it before `serve`.
-    pub playback_completion: PlaybackCompletion,
     /// For troubleshooting: hold every isochronous completion this long once
     /// a minute, to reproduce a system stall. Set it before `serve`.
     pub stall_test: Option<Duration>,
@@ -65,46 +63,6 @@ pub struct Server {
     next_connection: AtomicU64,
 }
 
-/// When a playback URB is reported complete.
-///
-/// usbaudio.sys, Windows' UAC1 driver, sends each playback URB about a
-/// millisecond after an earlier one completes, keeping one to three queued,
-/// and resets the pipe whenever a completion leaves it nothing queued. Under
-/// load it stops sending for tens of milliseconds, and after a reset it can
-/// keep resetting the pipe after every URB. The cables are UAC2 devices,
-/// served by usbaudio2.sys, which refills a URB within a fraction of a
-/// millisecond of each completion, so they complete URBs as a host
-/// controller does.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PlaybackCompletion {
-    /// When its last frame has ended, as USB host controllers do.
-    #[default]
-    End,
-    /// When its first frame begins, as long as another URB is queued behind
-    /// it, which gives the driver a URB's length more time to send the next;
-    /// otherwise when its last frame ends, or as soon as another URB arrives.
-    /// Its audio is already in the delay line and plays at its frames either
-    /// way.
-    Start,
-}
-
-impl PlaybackCompletion {
-    pub fn parse(text: &str) -> Option<PlaybackCompletion> {
-        match text {
-            "end" => Some(PlaybackCompletion::End),
-            "start" => Some(PlaybackCompletion::Start),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            PlaybackCompletion::End => "end",
-            PlaybackCompletion::Start => "start",
-        }
-    }
-}
-
 /// How often the stall test holds the completions.
 const STALL_TEST_PERIOD: Duration = Duration::from_secs(60);
 
@@ -122,7 +80,6 @@ impl Server {
             devices: Mutex::new(devices),
             logger,
             diagnostics: false,
-            playback_completion: PlaybackCompletion::default(),
             stall_test: None,
             started: Instant::now(),
             stall_logged: AtomicU64::new(0),
@@ -394,9 +351,6 @@ impl Server {
                         // frames as soon as it arrives, so it plays at its
                         // frame however late its URB completes.
                         device.write_playback(slot.start, iso_payloads(&submit.out, &submit.packets));
-                        if self.playback_completion == PlaybackCompletion::Start {
-                            submit.early_at = Some(now.frame_start(slot.start));
-                        }
                         // A host controller cannot send a packet on a frame
                         // that has already begun; it reports it as not sent.
                         // The audio still plays: the delay line has room.
@@ -526,23 +480,7 @@ impl Server {
         match (req.basic.endpoint, req.basic.direction) {
             (1, DIRECTION_OUT) => {
                 // The audio went into the delay line when the URB arrived.
-                let early = match submit.early_at {
-                    Some(early_at) => wait_for_early_completion(
-                        state,
-                        req.basic.endpoint,
-                        event,
-                        early_at,
-                        submit.complete_at,
-                        &cancelled,
-                    ),
-                    None => Ok(false),
-                };
-                let completed = match early {
-                    Ok(true) => self.hold_for_stall_test(event, &cancelled),
-                    Ok(false) => complete(submit),
-                    Err(cancelled) => Err(cancelled),
-                };
-                if completed.is_err() {
+                if complete(submit).is_err() {
                     return fail(submit, STATUS_CONN_RESET);
                 }
                 let actual = submit.out.len();
@@ -1030,11 +968,6 @@ impl ConnState {
         lock(&self.sched).late_packets += count as u64;
     }
 
-    /// How many URBs are pending on an endpoint.
-    pub(crate) fn iso_pending(&self, endpoint: u32) -> i64 {
-        lock(&self.sched).iso_pending.get(&endpoint).copied().unwrap_or(0)
-    }
-
     /// Reports how many URBs are pending on an endpoint and how far its next
     /// free frame is from the current one, for diagnostics.
     pub(crate) fn iso_state(&self, endpoint: u32, current: u64) -> (i64, i64, bool) {
@@ -1198,9 +1131,6 @@ pub(crate) struct ParsedSubmit {
     pub start: u64,
     pub complete_at: Option<Instant>,
     pub complete_frame: u64,
-    /// For a playback URB with `PlaybackCompletion::Start`: when its first
-    /// frame begins, the earliest it may complete.
-    pub early_at: Option<Instant>,
     /// For a playback URB: how many of its first packets were scheduled on
     /// frames that had already begun when it arrived.
     pub late_packets: u32,
@@ -1228,7 +1158,6 @@ impl ParsedSubmit {
             complete_at: None,
             start: 0,
             complete_frame: 0,
-            early_at: None,
             late_packets: 0,
             tracked: false,
             host_start_frame: 0,
@@ -1405,48 +1334,6 @@ fn wait_iso_completion(
         event.wait(Some(complete_at));
     }
     wait_bus_frame(event, end_frame, cancelled)
-}
-
-/// For a playback URB completed at its first frame: waits for that frame,
-/// then for as long as no other URB is queued behind it, until `end_at`.
-/// Returns whether it may complete before its last frame ends.
-///
-/// usbaudio resets the pipe whenever a completion leaves it nothing queued,
-/// and after a reset it sends a single URB. Completing that URB at its first
-/// frame would leave nothing queued again within a millisecond, so usbaudio
-/// would reset the pipe every few milliseconds; a URB with nothing behind it
-/// waits for its last frame, as a host controller would complete it.
-fn wait_for_early_completion(
-    state: &ConnState,
-    endpoint: u32,
-    event: &Event,
-    early_at: Instant,
-    end_at: Option<Instant>,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<bool, Cancelled> {
-    while Instant::now() < early_at {
-        if cancelled() {
-            return Err(Cancelled);
-        }
-        event.wait(Some(early_at));
-    }
-    loop {
-        // The pending count includes this URB.
-        if state.iso_pending(endpoint) > 1 {
-            return Ok(true);
-        }
-        let Some(end_at) = end_at else {
-            return Ok(false);
-        };
-        if Instant::now() >= end_at {
-            return Ok(false);
-        }
-        if cancelled() {
-            return Err(Cancelled);
-        }
-        // A new URB on the endpoint signals the event.
-        event.wait(Some(end_at));
-    }
 }
 
 fn response_payload_length(req: &SubmitRequest, packets: &[IsoPacket]) -> usize {
