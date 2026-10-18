@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::audio::Ring;
+use crate::audio::{DelayLine, Gain};
 
 pub const DESCRIPTOR_DEVICE: u8 = 0x01;
 pub const DESCRIPTOR_CONFIGURATION: u8 = 0x02;
@@ -170,21 +170,15 @@ fn string_descriptor(s: &str) -> Vec<u8> {
     b
 }
 
-/// The default elastic reserve the capture side keeps in the ring. It covers
-/// the 10 ms packet sawtooth and the short gaps of routine host scheduling
-/// hiccups while keeping the cable's added latency low.
-pub const DEFAULT_RESERVE_MS: i64 = 40;
+/// The default delay between a cable's playback and recording sides. Windows
+/// sends playback about 10 ms ahead of its frames, so in steady streaming any
+/// delay works; this much also covers playback that arrives up to about 50 ms
+/// late after a system stall.
+pub const DEFAULT_LATENCY_MS: i64 = 40;
 
-/// The smallest usable reserve: below it, the 10 ms granularity of USB
-/// transfers alone would underrun the ring.
-pub const MIN_RESERVE_MS: i64 = 10;
-
-/// The smallest ring-buffer capacity a cable accepts: the reserve may use at
-/// most half the ring, so this leaves room for the smallest reserve.
-pub const MIN_BUFFER_MS: i64 = 2 * MIN_RESERVE_MS;
-
-/// The largest ring-buffer capacity a cable accepts.
-pub const MAX_BUFFER_MS: i64 = 2000;
+/// The delay range a cable accepts, in milliseconds (bus frames).
+pub const MIN_LATENCY_MS: i64 = 1;
+pub const MAX_LATENCY_MS: i64 = 1000;
 
 pub const REQUEST_GET_STATUS: u8 = 0x00;
 pub const REQUEST_CLEAR_FEATURE: u8 = 0x01;
@@ -239,9 +233,8 @@ pub struct Device {
     pub number: u32,
     pub bus_id: String,
     pub descriptors: Descriptors,
-    pub buffer: Ring,
-    /// The elastic reserve, in PCM frames, the capture side keeps in `buffer`.
-    reserve_frames: usize,
+    /// Carries the playback endpoint's audio to the capture endpoint.
+    pub audio: DelayLine,
     state: Mutex<DeviceState>,
 }
 
@@ -249,54 +242,57 @@ struct DeviceState {
     configuration: u8,
     alt_setting: HashMap<u8, u8>,
     sample_rate: u32,
+    /// The playback (unit 2) and recording (unit 5) feature units.
+    features: [FeatureUnit; 2],
+}
+
+/// A feature unit's mute and volume controls, as Windows set them.
+#[derive(Clone, Copy, Default)]
+struct FeatureUnit {
     mute: bool,
+    /// In 1/256 dB; `VOLUME_SILENT` is minus infinity.
     volume: i16,
 }
+
+/// The feature unit IDs in the descriptors: playback, then recording.
+const FEATURE_UNITS: [u8; 2] = [2, 5];
+/// The volume range the feature units report, in 1/256 dB.
+const VOLUME_MIN: i16 = -60 * 256;
+const VOLUME_MAX: i16 = 0;
+const VOLUME_RES: i16 = 256;
+/// UAC1's volume value for silence (minus infinity dB).
+const VOLUME_SILENT: i16 = i16::MIN;
 
 impl Device {
     /// Cable `number` with its default name and serial number.
     #[cfg(test)]
-    pub fn new(number: u32, latency_ms: i64, reserve_ms: i64) -> Result<Device, String> {
+    pub fn new(number: u32, latency_ms: i64) -> Result<Device, String> {
         let (serial, name) = (format!("VCABLE-{number:03}"), format!("Virtual Cable {number:02}"));
-        Device::named(number, &serial, &name, latency_ms, reserve_ms)
+        Device::named(number, &serial, &name, latency_ms)
     }
 
     /// Creates the cable with ID `number`, serial number `serial`, called
-    /// `name`, whose ring holds `latency_ms` of audio, of which the capture
-    /// side keeps `reserve_ms` as its elastic reserve. The reserve is limited
-    /// to half the ring.
-    pub fn named(number: u32, serial: &str, name: &str, latency_ms: i64, reserve_ms: i64) -> Result<Device, String> {
+    /// `name`, whose recording side plays its playback side's audio
+    /// `latency_ms` later.
+    pub fn named(number: u32, serial: &str, name: &str, latency_ms: i64) -> Result<Device, String> {
         let descriptors = Descriptors::named(number, serial, name)?;
-        let latency_ms = latency_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
-        // 48 kHz * 2 channels * 3 bytes/sample (24-bit PCM).
-        let capacity = 48000 * 2 * 3 * latency_ms as usize / 1000;
-        let mut reserve_ms = reserve_ms.max(MIN_RESERVE_MS);
-        if reserve_ms > latency_ms / 2 {
-            reserve_ms = latency_ms / 2;
-        }
+        let latency_ms = latency_ms.clamp(MIN_LATENCY_MS, MAX_LATENCY_MS);
         Ok(Device {
             number,
             bus_id: bus_id(number),
             descriptors,
-            buffer: Ring::new_framed(capacity, 6),
-            reserve_frames: 48 * reserve_ms as usize,
+            audio: DelayLine::new(latency_ms as u64),
             state: Mutex::new(DeviceState {
                 configuration: 0,
                 alt_setting: HashMap::from([(0, 0), (1, 0), (2, 0)]),
                 sample_rate: 48000,
-                mute: false,
-                volume: 0,
+                features: [FeatureUnit::default(); 2],
             }),
         })
     }
 
     pub fn product(&self) -> &str {
         &self.descriptors.product
-    }
-
-    /// The elastic reserve, in PCM frames, the capture side keeps.
-    pub fn reserve_frames(&self) -> usize {
-        self.reserve_frames
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, DeviceState> {
@@ -330,7 +326,8 @@ impl Device {
                     for iface in 0..3 {
                         d.alt_setting.insert(iface, 0);
                     }
-                    self.buffer.reset();
+                    self.audio.end_playback();
+                    self.audio.end_capture();
                     (Vec::new(), 0)
                 }
                 REQUEST_GET_CONFIGURATION => (truncate(vec![d.configuration], setup.length), 0),
@@ -341,8 +338,10 @@ impl Device {
                         return (Vec::new(), STALL);
                     }
                     d.alt_setting.insert(iface, alt);
-                    if alt == 0 && (iface == 1 || iface == 2) {
-                        self.buffer.reset();
+                    match (iface, alt) {
+                        (1, 0) => self.audio.end_playback(),
+                        (2, 0) => self.audio.end_capture(),
+                        _ => {}
                     }
                     (Vec::new(), 0)
                 }
@@ -387,39 +386,42 @@ impl Device {
             }
         }
 
-        // Feature-unit mute/volume requests. Windows may query these because the
-        // topology advertises a basic feature unit.
+        // Feature-unit mute and volume. Windows treats them as hardware
+        // controls, so they are applied to the audio on its way from the
+        // playback side to the recording side.
         let entity_id = (setup.index >> 8) as u8;
         let interface_number = setup.index as u8;
-        if recipient == 0x01 && interface_number == 0 && (entity_id == 2 || entity_id == 5) {
-            // interface/entity
+        if recipient == 0x01
+            && interface_number == 0
+            && let Some(unit) = FEATURE_UNITS.iter().position(|&id| id == entity_id)
+        {
+            let reply = |value: Vec<u8>| (truncate(value, setup.length), 0);
+            let feature = d.features[unit];
             let control_selector = (setup.value >> 8) as u8;
-            match control_selector {
-                0x01 => match setup.request {
-                    // MUTE_CONTROL
-                    AUDIO_SET_CUR => {
-                        if let Some(&first) = out.first() {
-                            d.mute = first != 0;
-                        }
-                        return (Vec::new(), 0);
+            match (control_selector, setup.request) {
+                // MUTE_CONTROL
+                (0x01, AUDIO_SET_CUR) => {
+                    if let Some(&first) = out.first() {
+                        d.features[unit].mute = first != 0;
+                        self.audio.set_gain(feature_gain(&d.features));
                     }
-                    AUDIO_GET_CUR => return (truncate(vec![d.mute as u8], setup.length), 0),
-                    _ => {}
-                },
-                0x02 => match setup.request {
-                    // VOLUME_CONTROL, signed 1/256 dB
-                    AUDIO_SET_CUR => {
-                        if out.len() >= 2 {
-                            d.volume = i16::from_le_bytes([out[0], out[1]]);
-                        }
-                        return (Vec::new(), 0);
+                    return (Vec::new(), 0);
+                }
+                (0x01, AUDIO_GET_CUR) => return reply(vec![feature.mute as u8]),
+                // VOLUME_CONTROL, signed 1/256 dB
+                (0x02, AUDIO_SET_CUR) => {
+                    if out.len() >= 2 {
+                        let volume = i16::from_le_bytes([out[0], out[1]]);
+                        d.features[unit].volume =
+                            if volume == VOLUME_SILENT { volume } else { volume.clamp(VOLUME_MIN, VOLUME_MAX) };
+                        self.audio.set_gain(feature_gain(&d.features));
                     }
-                    AUDIO_GET_CUR => return (truncate(d.volume.to_le_bytes().to_vec(), setup.length), 0),
-                    AUDIO_GET_MIN => return (truncate((-60i16 * 256).to_le_bytes().to_vec(), setup.length), 0),
-                    AUDIO_GET_MAX => return (truncate(0i16.to_le_bytes().to_vec(), setup.length), 0),
-                    AUDIO_GET_RES => return (truncate(256i16.to_le_bytes().to_vec(), setup.length), 0),
-                    _ => {}
-                },
+                    return (Vec::new(), 0);
+                }
+                (0x02, AUDIO_GET_CUR) => return reply(feature.volume.to_le_bytes().to_vec()),
+                (0x02, AUDIO_GET_MIN) => return reply(VOLUME_MIN.to_le_bytes().to_vec()),
+                (0x02, AUDIO_GET_MAX) => return reply(VOLUME_MAX.to_le_bytes().to_vec()),
+                (0x02, AUDIO_GET_RES) => return reply(VOLUME_RES.to_le_bytes().to_vec()),
                 _ => {}
             }
         }
@@ -437,22 +439,39 @@ impl Device {
         d.configuration == 1 && d.alt_setting.get(&2) == Some(&1)
     }
 
-    pub fn write_playback(&self, p: &[u8]) -> usize {
-        if !self.playback_active() {
-            return 0;
+    /// Stores a playback URB's packets, scheduled from bus frame `start`.
+    /// Ignored until the playback interface is active: Windows can queue the
+    /// first URB just before its SET_INTERFACE.
+    pub fn write_playback<'a>(&self, start: u64, packets: impl IntoIterator<Item = &'a [u8]>) {
+        if self.playback_active() {
+            self.audio.write(start, packets);
         }
-        self.buffer.write(p)
     }
 
-    pub fn read_capture(&self, p: &mut [u8]) -> usize {
-        if !self.capture_active() {
-            p.fill(0);
-            return 0;
+    /// Fills a capture URB's packets, scheduled from bus frame `start` and
+    /// laid out back to back in `out` with the given lengths. Silence while
+    /// the recording interface is inactive.
+    pub fn read_capture(&self, start: u64, out: &mut [u8], lengths: impl IntoIterator<Item = usize>) {
+        let (capturing, playing) = {
+            let d = self.lock();
+            let active = |iface| d.configuration == 1 && d.alt_setting.get(&iface) == Some(&1);
+            (active(2), active(1))
+        };
+        if !capturing {
+            out.fill(0);
+            return;
         }
-        // Keep an elastic reserve for scheduling jitter. The PI resampler learns
-        // clock drift gradually rather than chasing individual USB packets.
-        self.buffer.read_adaptive_pcm24(p, self.reserve_frames)
+        self.audio.read(start, out, lengths, playing);
     }
+}
+
+/// The gain of the playback and recording feature units in series.
+fn feature_gain(features: &[FeatureUnit; 2]) -> Gain {
+    if features.iter().any(|f| f.mute || f.volume == VOLUME_SILENT) {
+        return Gain::Scale(0.0);
+    }
+    let volume: i32 = features.iter().map(|f| f.volume as i32).sum();
+    if volume == 0 { Gain::Unity } else { Gain::Scale(10f32.powf(volume as f32 / 256.0 / 20.0)) }
 }
 
 fn truncate(mut b: Vec<u8>, n: u16) -> Vec<u8> {
@@ -543,7 +562,7 @@ mod tests {
 
     #[test]
     fn get_device_descriptor() {
-        let d = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+        let d = Device::new(1, DEFAULT_LATENCY_MS).unwrap();
         let setup = SetupPacket {
             request_type: 0x80,
             request: REQUEST_GET_DESCRIPTOR,
@@ -557,7 +576,7 @@ mod tests {
 
     #[test]
     fn set_and_get_interface() {
-        let d = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+        let d = Device::new(1, DEFAULT_LATENCY_MS).unwrap();
         let control = |request_type, request, index, value, length| {
             d.handle_control(SetupPacket { request_type, request, value, index, length }, &[])
         };
@@ -569,7 +588,7 @@ mod tests {
 
     #[test]
     fn sampling_rate() {
-        let d = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+        let d = Device::new(1, DEFAULT_LATENCY_MS).unwrap();
         let setup = SetupPacket { request_type: 0xA2, request: AUDIO_GET_CUR, value: 0x0100, index: 0x82, length: 3 };
         let (data, status) = d.handle_control(setup, &[]);
         assert_eq!((status, data.len()), (0, 3));
@@ -578,14 +597,52 @@ mod tests {
     }
 
     #[test]
-    fn reserve_is_limited_to_half_the_buffer() {
-        assert_eq!(Device::new(1, 500, 40).unwrap().reserve_frames(), 48 * 40);
-        assert_eq!(Device::new(1, 60, 40).unwrap().reserve_frames(), 48 * 30);
-        assert_eq!(Device::new(1, 500, 1).unwrap().reserve_frames(), 48 * MIN_RESERVE_MS as usize);
-        // A ring below the minimum is enlarged, so the smallest reserve still
-        // fits in half of it.
-        let small = Device::new(1, 10, 40).unwrap();
-        assert_eq!(small.reserve_frames(), 48 * MIN_RESERVE_MS as usize);
-        assert_eq!(small.buffer.capacity(), 48 * 6 * MIN_BUFFER_MS as usize);
+    fn latency_is_kept_in_range() {
+        assert_eq!(Device::new(1, 40).unwrap().audio.delay(), 40);
+        assert_eq!(Device::new(1, 0).unwrap().audio.delay(), MIN_LATENCY_MS as u64);
+        assert_eq!(Device::new(1, 5000).unwrap().audio.delay(), MAX_LATENCY_MS as u64);
+    }
+
+    /// The playback and recording volume and mute controls are separate, and
+    /// both apply to the audio on its way through the cable.
+    #[test]
+    fn volume_and_mute_apply_to_the_loopback() {
+        let d = Device::new(1, 10).unwrap();
+        let control = |request_type, request, value, index, data: &[u8]| {
+            let setup = SetupPacket { request_type, request, value, index, length: data.len().max(2) as u16 };
+            d.handle_control(setup, data)
+        };
+        control(0x00, REQUEST_SET_CONFIGURATION, 1, 0, &[]);
+        control(0x01, REQUEST_SET_INTERFACE, 1, 1, &[]);
+        control(0x01, REQUEST_SET_INTERFACE, 1, 2, &[]);
+        // Plays one sample of 0x400000 through the next frame and returns it.
+        let frame = std::cell::Cell::new(1000);
+        let sample = |d: &Device| {
+            let mut packet = vec![0u8; crate::audio::PACKET_BYTES];
+            packet[..3].copy_from_slice(&[0x00, 0x00, 0x40]);
+            d.write_playback(frame.get(), [packet.as_slice()]);
+            let mut out = vec![0u8; crate::audio::PACKET_BYTES];
+            d.read_capture(frame.get() + 10, &mut out, [crate::audio::PACKET_BYTES]);
+            frame.set(frame.get() + 1);
+            i32::from_le_bytes([out[0], out[1], out[2], 0])
+        };
+        const PLAYBACK: u16 = 2 << 8;
+        const RECORDING: u16 = 5 << 8;
+        assert_eq!(sample(&d), 0x40_0000, "0 dB passes through unchanged");
+
+        let minus_6_db = (-6i16 * 256).to_le_bytes();
+        assert_eq!(control(0x21, AUDIO_SET_CUR, 0x0200, PLAYBACK, &minus_6_db).1, 0);
+        let scaled = sample(&d) as f64 / 0x40_0000 as f64;
+        assert!((scaled - 0.501).abs() < 0.002, "playback volume -6 dB gave {scaled}");
+        assert_eq!(control(0xA1, AUDIO_GET_CUR, 0x0200, PLAYBACK, &[]).0, minus_6_db);
+        assert_eq!(control(0xA1, AUDIO_GET_CUR, 0x0200, RECORDING, &[]).0, [0, 0], "units are separate");
+
+        control(0x21, AUDIO_SET_CUR, 0x0100, RECORDING, &[1]);
+        assert_eq!(sample(&d), 0, "recording mute");
+        control(0x21, AUDIO_SET_CUR, 0x0100, RECORDING, &[0]);
+        control(0x21, AUDIO_SET_CUR, 0x0200, PLAYBACK, &[0, 0]);
+        assert_eq!(sample(&d), 0x40_0000, "back to unity");
+        control(0x21, AUDIO_SET_CUR, 0x0200, RECORDING, &VOLUME_SILENT.to_le_bytes());
+        assert_eq!(sample(&d), 0, "minus infinity dB is silence");
     }
 }

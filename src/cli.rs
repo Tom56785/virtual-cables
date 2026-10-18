@@ -3,6 +3,8 @@
 
 use clap::Parser;
 
+use crate::usbip::server::PlaybackCompletion;
+
 #[derive(Parser, Debug, Default, PartialEq)]
 #[command(
     name = "VirtualCables",
@@ -19,20 +21,24 @@ pub struct Cli {
     #[arg(long, value_name = "COUNT")]
     pub cables: Option<i64>,
 
-    /// Audio ring-buffer capacity in milliseconds, 20-2000 [config.toml: buffer_ms, default 250]
-    #[arg(long)]
-    pub buffer_ms: Option<i64>,
+    /// Delay between each cable's playback and recording sides, 1-1000 ms [config.toml: latency_ms, default 40]
+    #[arg(long, value_name = "MS")]
+    pub latency_ms: Option<i64>,
 
-    /// Audio kept buffered against scheduling hiccups, in milliseconds; adds this much latency
-    /// [config.toml: reserve_ms, default 40]
-    #[arg(long)]
-    pub reserve_ms: Option<i64>,
+    /// When playback transfers complete: start (of their first frame) or end (of their last) [config.toml: playback_completion, default start]
+    #[arg(long, value_name = "WHEN", value_parser = parse_playback_completion)]
+    pub playback_completion: Option<PlaybackCompletion>,
 
     /// Log USB/IP stream traces and pipe-reset events for troubleshooting [config.toml: diagnostics, default false]
     #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true", value_parser = parse_bool_arg)]
     pub diagnostics: Option<bool>,
 
-    /// Validate descriptors and ring buffers, then exit
+    /// Hold all audio transfers this many ms once a minute, to reproduce a system stall; 0 is off
+    /// [config.toml: stall_test_ms, default 0]
+    #[arg(long, value_name = "MS")]
+    pub stall_test_ms: Option<i64>,
+
+    /// Validate descriptors and the audio path, then exit
     #[arg(long)]
     pub self_test: bool,
 
@@ -68,6 +74,10 @@ fn parse_bool_arg(value: &str) -> Result<bool, String> {
     crate::config::parse_bool(value).ok_or_else(|| format!("expected true or false, got {value:?}"))
 }
 
+fn parse_playback_completion(value: &str) -> Result<PlaybackCompletion, String> {
+    PlaybackCompletion::parse(value).ok_or_else(|| format!("expected end or start, got {value:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,14 +89,16 @@ mod tests {
 
     #[test]
     fn parses_options() {
-        let cli = parse(&["--cables", "3", "--listen=0.0.0.0:1", "--buffer-ms", "500", "--diagnostics"]).unwrap();
+        let cli = parse(&["--cables", "3", "--listen=0.0.0.0:1", "--latency-ms", "25", "--diagnostics"]).unwrap();
         assert_eq!(cli.cables, Some(3));
         assert_eq!(cli.listen.as_deref(), Some("0.0.0.0:1"));
-        assert_eq!(cli.buffer_ms, Some(500));
+        assert_eq!(cli.latency_ms, Some(25));
         assert_eq!(cli.diagnostics, Some(true));
-        assert_eq!(cli.reserve_ms, None, "unset options fall back to config.toml");
+        assert_eq!(cli.stall_test_ms, None, "unset options fall back to config.toml");
 
         assert_eq!(parse(&["--diagnostics=false"]).unwrap().diagnostics, Some(false));
+        let cli = parse(&["--playback-completion", "start", "--stall-test-ms", "40"]).unwrap();
+        assert_eq!((cli.playback_completion, cli.stall_test_ms), (Some(PlaybackCompletion::Start), Some(40)));
         assert_eq!(parse(&[]).unwrap(), Cli::default());
     }
 
@@ -101,7 +113,13 @@ mod tests {
 
     #[test]
     fn rejects_bad_input() {
-        for args in [&["--cables", "x"][..], &["--bogus"], &["--cables"], &["--diagnostics=maybe"]] {
+        for args in [
+            &["--cables", "x"][..],
+            &["--bogus"],
+            &["--cables"],
+            &["--diagnostics=maybe"],
+            &["--playback-completion", "middle"],
+        ] {
             let err = parse(args).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{args:?}");
         }
@@ -110,15 +128,15 @@ mod tests {
 
     #[test]
     fn help_shows_the_real_defaults() {
-        use crate::config::{DEFAULT_BUFFER_MS, DEFAULT_LISTEN};
-        use crate::uac1::{DEFAULT_RESERVE_MS, MAX_BUFFER_MS, MIN_BUFFER_MS};
+        use crate::config::DEFAULT_LISTEN;
+        use crate::uac1::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
         let help = Cli::command().render_help().to_string();
         for expected in [
             format!("default {DEFAULT_LISTEN}"),
             "[[cable]] tables, default none]".to_string(),
-            format!("{MIN_BUFFER_MS}-{MAX_BUFFER_MS}"),
-            format!("default {DEFAULT_BUFFER_MS}]"),
-            format!("default {DEFAULT_RESERVE_MS}]"),
+            format!("{MIN_LATENCY_MS}-{MAX_LATENCY_MS} ms"),
+            format!("latency_ms, default {DEFAULT_LATENCY_MS}]"),
+            format!("default {}]", PlaybackCompletion::default().name()),
         ] {
             assert!(help.contains(&expected), "help text lacks {expected:?}:\n{help}");
         }

@@ -1,474 +1,244 @@
-//! Elastic PCM ring buffer between a cable's playback and capture endpoints.
+//! A cable's audio path: a delay line addressed by USB bus frame.
+//!
+//! Both endpoints of a cable run on the same bus frame clock. Windows sends
+//! the playback endpoint exactly one 48-sample packet per 1 ms frame, and the
+//! capture endpoint returns one per frame, so there is no clock drift to
+//! correct. Each playback packet is stored under the frame it is scheduled
+//! for, and the capture packet of frame F is the playback packet of frame
+//! F - delay. Audio passes through bit for bit with a constant latency, and a
+//! frame whose audio never arrived is silent for exactly that frame.
 
 use std::sync::Mutex;
 
-/// A bounded, thread-safe byte ring buffer. When the frame size is greater
-/// than one, writes and overrun recovery preserve complete PCM sample frames.
-pub struct Ring {
-    frame_size: usize,
-    capacity: usize,
-    state: Mutex<RingState>,
+/// Bytes per PCM frame: stereo, 24-bit.
+pub const FRAME_BYTES: usize = 6;
+/// Bytes per 1 ms packet at 48 kHz: 48 PCM frames.
+pub const PACKET_BYTES: usize = 48 * FRAME_BYTES;
+/// Packets the delay line holds beyond the delay, for playback that Windows
+/// queues ahead of time.
+const QUEUE_SLOTS: u64 = 1024;
+/// Marks a slot that holds no audio.
+const EMPTY: u64 = u64::MAX;
+/// How far a stream that was moved later must have caught up before it is
+/// moved back, skipping the audio in between: a URB's length, so that it is
+/// not moved for every millisecond it gains.
+const CATCH_UP_FRAMES: u64 = 10;
+
+/// The gain the capture side applies: the product of the cable's playback
+/// and recording volume controls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Gain {
+    /// 0 dB on both controls: samples are copied unchanged.
+    Unity,
+    /// A linear factor; 0 for mute.
+    Scale(f32),
 }
 
-struct RingState {
-    buf: Vec<u8>,
-    read: usize,
-    write: usize,
-    size: usize,
-    dropped: u64,
-    underruns: u64,
-    phase: f64,
-    last_output: [i32; 2],
-    fade_from: [i32; 2],
-    fade_in: usize,
-    fade_out: usize,
-    underrun: bool,
-    needs_fade: bool,
-    filtered_fill: f64,
-    correction: f64,
-    correction_integral: f64,
-    started: bool,
-    primed: bool,
-    /// The reserve the reader keeps. It grows when stalls repeat, and steps
-    /// back toward the configured reserve once the stream has been stable.
-    reserve_frames: usize,
-    /// Frames the reader has produced since it was first primed, silence
-    /// included: the clock for stall timing.
-    clock: u64,
-    /// Silent frames produced in the current outage, until audio arrives again.
-    outage: Option<u64>,
-    last_stall: Option<u64>,
-    settled_since: u64,
-    stalls: u64,
-    overruns: u64,
+pub struct DelayLine {
+    delay: u64,
+    slots: u64,
+    state: Mutex<LineState>,
 }
 
-/// A snapshot of the ring's health, for the log.
+struct LineState {
+    /// One packet per slot; the packet of frame F is in slot F % slots.
+    audio: Vec<u8>,
+    /// The frame whose audio each slot holds, or `EMPTY`.
+    frames: Vec<u64>,
+    playback: Option<Segment>,
+    /// The first frame the running playback stream placed audio in.
+    playback_first: Option<u64>,
+    /// The latest frame the capture side has read.
+    last_read: Option<u64>,
+    gain: Gain,
+    missing: u64,
+    realigned: u64,
+    caught_up: u64,
+}
+
+/// A run of contiguously scheduled playback packets.
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    /// The scheduled frame the next packet continues from.
+    next: u64,
+    /// Added to scheduled frames once audio arrived too late to play at its
+    /// own frame.
+    offset: u64,
+}
+
+/// Counters for the log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RingStatus {
-    pub buffered_frames: usize,
-    /// The reserve the reader keeps, in frames; 0 before its first read.
-    pub reserve_frames: usize,
-    pub correction_ppm: i64,
-    /// Underruns the reader recovered from: stalls, not the source stopping.
-    pub underruns: u64,
-    /// Writes that discarded unread audio because the ring was full.
-    pub overruns: u64,
+pub struct LineStatus {
+    /// Frames of silence the capture side produced while playback was
+    /// running: audio that arrived too late or never arrived.
+    pub missing: u64,
+    /// Times playback audio arrived after its frame had been played, and the
+    /// rest of its stream was moved later to keep playing.
+    pub realigned: u64,
+    /// Times a stream that had been moved later caught up and was moved back
+    /// toward its own frames.
+    pub caught_up: u64,
 }
 
-const CLICK_FADE_FRAMES: usize = 48;
-
-/// An outage up to this long is a stall; a longer one is the source stopping,
-/// which says nothing about whether the reserve is large enough.
-const MAX_STALL_FRAMES: u64 = 48000;
-
-/// Two stalls this close together mean the reserve is too small for the
-/// current system load, rather than a one-off hiccup.
-const REPEAT_STALL_FRAMES: u64 = 10 * 48000;
-
-/// After this long without a stall, a grown reserve steps back toward the
-/// configured one.
-const RELAX_FRAMES: u64 = 120 * 48000;
-
-impl Ring {
-    /// Creates a byte-oriented ring, for callers that do not carry framed audio.
-    pub fn new(capacity: usize) -> Ring {
-        Ring::new_framed(capacity, 1)
-    }
-
-    /// Creates a ring that preserves complete frames when dropping data under
-    /// pressure. For stereo 24-bit PCM, the frame size is 6 bytes.
-    pub fn new_framed(capacity: usize, frame_size: usize) -> Ring {
-        let frame_size = frame_size.max(1);
-        let capacity = capacity.max(frame_size) / frame_size * frame_size;
-        Ring {
-            frame_size,
-            capacity,
-            state: Mutex::new(RingState {
-                buf: vec![0; capacity],
-                read: 0,
-                write: 0,
-                size: 0,
-                dropped: 0,
-                underruns: 0,
-                phase: 0.0,
-                last_output: [0; 2],
-                fade_from: [0; 2],
-                fade_in: 0,
-                fade_out: 0,
-                underrun: false,
-                needs_fade: false,
-                filtered_fill: 0.0,
-                correction: 0.0,
-                correction_integral: 0.0,
-                started: false,
-                primed: false,
-                reserve_frames: 0,
-                clock: 0,
-                outage: None,
-                last_stall: None,
-                settled_since: 0,
-                stalls: 0,
-                overruns: 0,
+impl DelayLine {
+    /// A delay line that plays each frame's audio `delay` frames (ms) later.
+    pub fn new(delay: u64) -> DelayLine {
+        let slots = delay + QUEUE_SLOTS;
+        DelayLine {
+            delay,
+            slots,
+            state: Mutex::new(LineState {
+                audio: vec![0; slots as usize * PACKET_BYTES],
+                frames: vec![EMPTY; slots as usize],
+                playback: None,
+                playback_first: None,
+                last_read: None,
+                gain: Gain::Unity,
+                missing: 0,
+                realigned: 0,
+                caught_up: 0,
             }),
         }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, RingState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LineState> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn available(&self) -> usize {
-        self.lock().size
+    pub fn delay(&self) -> u64 {
+        self.delay
     }
 
-    /// Returns the buffered byte count and the dropped and underrun byte totals.
-    pub fn stats(&self) -> (usize, u64, u64) {
-        let r = self.lock();
-        (r.size, r.dropped, r.underruns)
+    pub fn status(&self) -> LineStatus {
+        let s = self.lock();
+        LineStatus { missing: s.missing, realigned: s.realigned, caught_up: s.caught_up }
     }
 
-    pub fn correction_ppm(&self) -> i64 {
-        (self.lock().correction * 1_000_000.0).round() as i64
+    pub fn set_gain(&self, gain: Gain) {
+        self.lock().gain = gain;
     }
 
-    pub fn status(&self) -> RingStatus {
-        let r = self.lock();
-        RingStatus {
-            buffered_frames: r.size / self.frame_size,
-            reserve_frames: r.reserve_frames,
-            correction_ppm: (r.correction * 1_000_000.0).round() as i64,
-            underruns: r.stalls,
-            overruns: r.overruns,
-        }
-    }
-
-    /// Keeps the newest complete frames. If the ring is full, old data is
-    /// discarded in whole frames; dropping individual bytes corrupts 24-bit PCM
-    /// sample/channel alignment and can cause audible crackling.
-    pub fn write(&self, p: &[u8]) -> usize {
-        let frame_size = self.frame_size;
-        let mut r = self.lock();
-        let r = &mut *r;
-
-        let complete_len = p.len() / frame_size * frame_size;
-        let mut discontinuity = complete_len != p.len();
-        if complete_len != p.len() {
-            r.dropped += (p.len() - complete_len) as u64;
-        }
-        let mut p = &p[..complete_len];
-        let mut overran = false;
-        if p.is_empty() {
-            if discontinuity {
-                r.needs_fade = true;
-            }
-            return 0;
-        }
-
-        // If a single write exceeds capacity, retain only its newest whole frames.
-        let capacity = r.buf.len();
-        if p.len() > capacity {
-            let discard = p.len() - capacity;
-            p = &p[discard..];
-            r.dropped += discard as u64;
-            discontinuity = true;
-            overran = true;
-        }
-
-        // Make room in complete frames, keeping both read position and buffer
-        // size aligned to PCM frame boundaries.
-        while capacity - r.size < p.len() {
-            r.read = (r.read + frame_size) % capacity;
-            r.size -= frame_size;
-            r.dropped += frame_size as u64;
-            discontinuity = true;
-            overran = true;
-        }
-        // A ring nobody reads yet fills up as a matter of course.
-        if overran && r.primed {
-            r.overruns += 1;
-        }
-
-        for &b in p {
-            let write = r.write;
-            r.buf[write] = b;
-            r.write = (write + 1) % capacity;
-        }
-        r.size += p.len();
-        if discontinuity {
-            r.needs_fade = true;
-        }
-        p.len()
-    }
-
-    /// Reads complete frames and fills unavailable frames with digital silence.
-    /// The caller should request a whole number of frames, as USB PCM transfers
-    /// normally do. Any non-frame tail is silenced rather than returned as a
-    /// partial sample.
-    pub fn read_silence(&self, p: &mut [u8]) -> usize {
-        let frame_size = self.frame_size;
-        let mut r = self.lock();
-        read_silence_locked(&mut r, frame_size, p)
-    }
-
-    /// Reads stereo packed 24-bit PCM from an elastic buffer. Occupancy
-    /// feedback tracks clock drift without reacting sharply to packet jitter.
-    /// Both startup and recovery wait for the full reserve: `target_frames`,
-    /// grown for as long as repeated stalls keep emptying the ring.
-    pub fn read_adaptive_pcm24(&self, p: &mut [u8], target_frames: usize) -> usize {
-        const FRAME_SIZE: usize = 6;
-        const FADE_FRAMES: usize = CLICK_FADE_FRAMES;
+    /// Stores playback packets scheduled on frames `start`, `start + 1`, ...
+    /// An empty packet carries no audio for its frame.
+    ///
+    /// A packet that arrives after its frame has been played cannot play on
+    /// time. Rather than drop it and every later packet of a stream that has
+    /// fallen behind, the stream is moved later, so that it plays again with
+    /// half the delay to spare; the frames in between are silent. Once the
+    /// stream catches up, it is moved back toward its own frames, skipping
+    /// the audio in between, so the cable returns to its normal latency.
+    pub fn write<'a>(&self, start: u64, packets: impl IntoIterator<Item = &'a [u8]>) {
         let mut guard = self.lock();
-        let r = &mut *guard;
-        if self.frame_size != FRAME_SIZE {
-            return read_silence_locked(r, self.frame_size, p);
-        }
-
-        let complete_len = p.len() / FRAME_SIZE * FRAME_SIZE;
-        p[complete_len..].fill(0);
-        if complete_len == 0 {
-            r.underruns += p.len() as u64;
-            return 0;
-        }
-
-        let capacity = r.buf.len();
-        let max_target_frames = (capacity / FRAME_SIZE / 2).max(2);
-        let base_frames = target_frames.clamp(2, max_target_frames);
-        r.reserve_frames = r.reserve_frames.clamp(base_frames, max_target_frames);
-        let frames = (complete_len / FRAME_SIZE) as u64;
-
-        let mut available_frames = r.size / FRAME_SIZE;
-        if !r.started {
-            // Audio is arriving again. If the outage was a stall rather than
-            // the source stopping, grow the reserve before refilling it.
-            if available_frames > 0
-                && let Some(silence) = r.outage.take()
-                && silence <= MAX_STALL_FRAMES
-            {
-                r.note_stall(max_target_frames);
+        let s = &mut *guard;
+        // A schedule that does not continue the previous URB is a new
+        // segment, played at its own frames again.
+        let mut segment = match s.playback {
+            Some(segment) if segment.next == start => segment,
+            _ => Segment { next: start, offset: 0 },
+        };
+        let mut scheduled = start;
+        for packet in packets {
+            let own = scheduled;
+            scheduled += 1;
+            let mut frame = own + segment.offset;
+            if let Some(read) = s.last_read {
+                // The earliest frame that leaves half the delay to spare, and
+                // never earlier than the packet's own frame.
+                let earliest = (read + 1 + self.delay / 2).max(own);
+                if frame <= read {
+                    segment.offset = earliest - own;
+                    frame = earliest;
+                    s.realigned += 1;
+                } else if segment.offset > 0 && frame >= earliest + CATCH_UP_FRAMES {
+                    segment.offset = earliest - own;
+                    frame = earliest;
+                    s.caught_up += 1;
+                }
+                // Never overwrite audio the capture side has yet to read.
+                if frame >= read + self.slots {
+                    continue;
+                }
             }
-            if available_frames < r.reserve_frames {
-                p[..complete_len].fill(0);
-                if r.primed {
-                    // Count recovery silence as well as frames lost after the ring empties.
-                    r.underruns += complete_len as u64;
-                    if let Some(silence) = &mut r.outage {
-                        *silence += frames;
-                    }
-                    r.tick(frames, base_frames);
-                }
-                return 0;
-            }
-            // Maintain the target reserve after recovery to absorb the same timing jitter.
-            r.started = true;
-            r.primed = true;
-            // The controller wound up against a supply shortfall it could not
-            // correct, so its estimate says nothing about clock drift. Discard it
-            // rather than unwinding it slowly once the supply is back to real time.
-            r.correction = 0.0;
-            r.correction_integral = 0.0;
-            r.filtered_fill = available_frames as f64;
-            r.phase = 0.0;
-            r.needs_fade = true;
-        } else {
-            // Filter packet-level queue jitter, then use a PI controller: the
-            // proportional term responds to fill changes while the integral term
-            // learns sustained clock offsets without forcing the queue toward empty.
-            let frames = (complete_len / FRAME_SIZE) as f64;
-            let dt = frames / 48000.0;
-            let fill_alpha = 1.0 - (-dt / 0.5).exp();
-            r.filtered_fill += (available_frames as f64 - r.filtered_fill) * fill_alpha;
-            let target_frames = r.reserve_frames as f64;
-            let error_ratio = (r.filtered_fill - target_frames) / target_frames;
-            const PROPORTIONAL_GAIN: f64 = 0.01;
-            const INTEGRAL_GAIN: f64 = 0.0005;
-            const MAX_RATE_CORRECTION: f64 = 0.005;
-
-            let integral = (r.correction_integral + error_ratio * INTEGRAL_GAIN * dt)
-                .clamp(-MAX_RATE_CORRECTION, MAX_RATE_CORRECTION);
-            let mut desired_correction = error_ratio * PROPORTIONAL_GAIN + integral;
-            if desired_correction > MAX_RATE_CORRECTION {
-                desired_correction = MAX_RATE_CORRECTION;
-                if error_ratio <= 0.0 {
-                    r.correction_integral = integral;
-                }
-            } else if desired_correction < -MAX_RATE_CORRECTION {
-                desired_correction = -MAX_RATE_CORRECTION;
-                if error_ratio >= 0.0 {
-                    r.correction_integral = integral;
-                }
-            } else {
-                r.correction_integral = integral;
-            }
-
-            let correction_alpha = 1.0 - (-dt / 0.25).exp();
-            r.correction += (desired_correction - r.correction) * correction_alpha;
+            s.playback_first.get_or_insert(frame);
+            s.store(self.slots, frame, packet);
         }
-        let input_per_output = 1.0 + r.correction;
-        let mut consumed = 0;
+        segment.next = scheduled;
+        s.playback = Some(segment);
+    }
 
-        let mut out = 0;
-        while out < complete_len {
-            available_frames = r.size / FRAME_SIZE;
-            if available_frames == 0 {
-                r.started = false;
-                if !r.underrun {
-                    r.underrun = true;
-                    r.fade_out = FADE_FRAMES;
-                    r.outage = Some(0);
-                }
-                if let Some(silence) = &mut r.outage {
-                    *silence += 1;
-                }
-                let mut gain = 0.0;
-                if r.fade_out > 0 {
-                    gain = (r.fade_out - 1) as f64 / FADE_FRAMES as f64;
-                    r.fade_out -= 1;
-                }
-                for channel in 0..2 {
-                    let value = (r.last_output[channel] as f64 * gain).round() as i32;
-                    r.last_output[channel] = value;
-                    encode_int24(&mut p[out + channel * 3..out + channel * 3 + 3], value);
-                }
-                r.underruns += FRAME_SIZE as u64;
-                if r.fade_out == 0 {
-                    r.needs_fade = true;
-                }
-                r.phase = 0.0;
-                out += FRAME_SIZE;
+    /// Fills capture packets for frames `start`, `start + 1`, ..., laid out
+    /// back to back in `out` with the given lengths, with the playback audio
+    /// of `delay` frames earlier. While `playback_active`, frames the
+    /// playback stream did not supply are counted as missing.
+    pub fn read(&self, start: u64, out: &mut [u8], lengths: impl IntoIterator<Item = usize>, playback_active: bool) {
+        let mut guard = self.lock();
+        let s = &mut *guard;
+        let mut pos = 0;
+        for (capture_frame, length) in (start..).zip(lengths) {
+            let length = length.min(out.len() - pos);
+            let dst = &mut out[pos..pos + length];
+            pos += length;
+            let Some(frame) = capture_frame.checked_sub(self.delay) else {
+                dst.fill(0);
                 continue;
-            }
-            if r.underrun {
-                r.underrun = false;
-                r.fade_out = 0;
-                r.needs_fade = true;
-            }
-            if r.needs_fade && r.fade_in == 0 {
-                r.fade_from = r.last_output;
-                r.fade_in = FADE_FRAMES;
-                r.needs_fade = false;
-            }
-            let mut fade_gain = -1.0;
-            if r.fade_in > 0 {
-                fade_gain = (FADE_FRAMES - r.fade_in + 1) as f64 / FADE_FRAMES as f64;
-                r.fade_in -= 1;
-            }
-
-            let first = r.read;
-            let second = (first + FRAME_SIZE) % capacity;
-            for channel in 0..2 {
-                let offset = channel * 3;
-                let a = decode_int24(r.buf[first + offset], r.buf[first + offset + 1], r.buf[first + offset + 2]);
-                let mut b = a;
-                if available_frames > 1 {
-                    b = decode_int24(r.buf[second + offset], r.buf[second + offset + 1], r.buf[second + offset + 2]);
+            };
+            s.last_read = Some(s.last_read.map_or(frame, |read| read.max(frame)));
+            let slot = (frame % self.slots) as usize;
+            if s.frames[slot] == frame {
+                let src = &s.audio[slot * PACKET_BYTES..(slot + 1) * PACKET_BYTES];
+                let n = length.min(PACKET_BYTES) / FRAME_BYTES * FRAME_BYTES;
+                apply_gain(s.gain, &src[..n], &mut dst[..n]);
+                dst[n..].fill(0);
+            } else {
+                dst.fill(0);
+                if playback_active && s.playback_first.is_some_and(|first| frame >= first) {
+                    s.missing += 1;
                 }
-                let mut value = (a as f64 + (b - a) as f64 * r.phase).round() as i32;
-                if fade_gain >= 0.0 {
-                    let from = r.fade_from[channel] as f64;
-                    value = (from + (value as f64 - from) * fade_gain).round() as i32;
-                }
-                r.last_output[channel] = value;
-                encode_int24(&mut p[out + offset..out + offset + 3], value);
             }
-
-            let position = r.phase + input_per_output;
-            let mut advance = position as usize;
-            r.phase = position - advance as f64;
-            if advance > available_frames {
-                advance = available_frames;
-                r.phase = 0.0;
-            }
-            if advance > 0 {
-                r.read = (r.read + advance * FRAME_SIZE) % capacity;
-                r.size -= advance * FRAME_SIZE;
-                consumed += advance * FRAME_SIZE;
-            }
-            out += FRAME_SIZE;
         }
-        if complete_len < p.len() {
-            r.underruns += (p.len() - complete_len) as u64;
-        }
-        r.tick(frames, base_frames);
-        consumed
+        out[pos..].fill(0);
     }
 
-    /// Clears the stream. The reserve grown by repeated stalls is kept: it
-    /// reflects the system's load rather than this stream.
-    pub fn reset(&self) {
-        let mut r = self.lock();
-        r.read = 0;
-        r.write = 0;
-        r.size = 0;
-        r.phase = 0.0;
-        r.last_output = [0; 2];
-        r.fade_from = [0; 2];
-        r.fade_in = 0;
-        r.fade_out = 0;
-        r.underrun = false;
-        r.needs_fade = false;
-        r.filtered_fill = 0.0;
-        r.correction = 0.0;
-        r.correction_integral = 0.0;
-        r.started = false;
-        r.primed = false;
-        r.outage = None;
-        r.last_stall = None;
+    /// The playback stream has stopped. Its queued audio still plays.
+    pub fn end_playback(&self) {
+        let mut s = self.lock();
+        s.playback = None;
+        s.playback_first = None;
+    }
+
+    /// The capture stream has stopped.
+    pub fn end_capture(&self) {
+        self.lock().last_read = None;
     }
 }
 
-impl RingState {
-    /// Records a stall the reader recovered from. A second stall within
-    /// `REPEAT_STALL_FRAMES` grows the reserve by half, up to `max_frames`.
-    fn note_stall(&mut self, max_frames: usize) {
-        self.stalls += 1;
-        if self.last_stall.is_some_and(|at| self.clock - at <= REPEAT_STALL_FRAMES) {
-            self.reserve_frames = (self.reserve_frames + self.reserve_frames / 2).min(max_frames);
+impl LineState {
+    fn store(&mut self, slots: u64, frame: u64, packet: &[u8]) {
+        if packet.is_empty() {
+            return;
         }
-        self.last_stall = Some(self.clock);
-        self.settled_since = self.clock;
-    }
-
-    /// Advances the stall clock by `frames` the reader produced. Each
-    /// `RELAX_FRAMES` without a stall undoes one growth step, down to
-    /// `base_frames`; the rate controller then drains the excess gently.
-    fn tick(&mut self, frames: u64, base_frames: usize) {
-        self.clock += frames;
-        if self.reserve_frames > base_frames && self.clock - self.settled_since >= RELAX_FRAMES {
-            self.reserve_frames = (self.reserve_frames * 2 / 3).max(base_frames);
-            self.settled_since = self.clock;
-        }
+        let slot = (frame % slots) as usize;
+        let dst = &mut self.audio[slot * PACKET_BYTES..(slot + 1) * PACKET_BYTES];
+        let n = packet.len().min(PACKET_BYTES) / FRAME_BYTES * FRAME_BYTES;
+        dst[..n].copy_from_slice(&packet[..n]);
+        dst[n..].fill(0);
+        self.frames[slot] = frame;
     }
 }
 
-fn read_silence_locked(r: &mut RingState, frame_size: usize, p: &mut [u8]) -> usize {
-    let complete_len = p.len() / frame_size * frame_size;
-    p[complete_len..].fill(0);
-    let capacity = r.buf.len();
-    let mut read = 0;
-    let mut i = 0;
-    while i < complete_len {
-        if r.size < frame_size {
-            p[i..complete_len].fill(0);
-            r.underruns += (complete_len - i) as u64;
-            break;
+/// Copies packed 24-bit samples from `src` to `dst`, scaled by `gain`.
+fn apply_gain(gain: Gain, src: &[u8], dst: &mut [u8]) {
+    let factor = match gain {
+        Gain::Unity => {
+            dst.copy_from_slice(src);
+            return;
         }
-        for j in 0..frame_size {
-            p[i + j] = r.buf[r.read];
-            r.read = (r.read + 1) % capacity;
-        }
-        r.size -= frame_size;
-        read += frame_size;
-        i += frame_size;
+        Gain::Scale(factor) => factor,
+    };
+    for (from, to) in src.as_chunks::<3>().0.iter().zip(dst.as_chunks_mut::<3>().0) {
+        let sample = decode_int24(from[0], from[1], from[2]);
+        encode_int24(to, (sample as f32 * factor).round() as i32);
     }
-    if complete_len < p.len() {
-        r.underruns += (p.len() - complete_len) as u64;
-    }
-    read
 }
 
 fn decode_int24(low: u8, middle: u8, high: u8) -> i32 {
@@ -490,150 +260,179 @@ fn encode_int24(dst: &mut [u8], value: i32) {
 mod tests {
     use super::*;
 
+    /// A packet whose every byte identifies its playback frame.
+    fn packet(frame: u64) -> Vec<u8> {
+        vec![(frame % 251) as u8 + 1; PACKET_BYTES]
+    }
+
+    /// Reads `count` capture packets from frame `start` and returns them.
+    fn read(line: &DelayLine, start: u64, count: usize, playback_active: bool) -> Vec<Vec<u8>> {
+        let mut out = vec![0xEE; count * PACKET_BYTES];
+        line.read(start, &mut out, std::iter::repeat_n(PACKET_BYTES, count), playback_active);
+        out.chunks(PACKET_BYTES).map(<[u8]>::to_vec).collect()
+    }
+
+    fn write(line: &DelayLine, start: u64, count: u64) {
+        let packets: Vec<Vec<u8>> = (start..start + count).map(packet).collect();
+        line.write(start, packets.iter().map(Vec::as_slice));
+    }
+
     #[test]
-    fn adaptive_read_discards_correction_after_underrun() {
-        const TARGET: usize = 480; // 10 ms
-        let r = Ring::new_framed(48000 * 6, 6);
-        r.write(&vec![0; TARGET * 6]);
-        let mut out = vec![0; 48 * 6]; // 1 ms
-        // Starve the reader so the controller winds up toward its limit.
-        for i in 0..2000 {
-            if i % 2 == 0 {
-                r.write(&vec![0; 48 * 6]);
-            }
-            r.read_adaptive_pcm24(&mut out, TARGET);
+    fn passes_audio_through_unchanged_after_the_delay() {
+        let line = DelayLine::new(40);
+        for urb in 0..20 {
+            write(&line, 1000 + urb * 10, 10);
         }
-        assert_ne!(r.correction_ppm(), 0, "controller did not respond to the shortfall");
-        // The repeated stalls have also grown the reserve.
-        r.write(&vec![0; r.status().reserve_frames * 6]);
-        r.read_adaptive_pcm24(&mut out, TARGET);
-        assert_eq!(r.correction_ppm(), 0, "correction after recovery");
-    }
-
-    /// Streams `ms` milliseconds in real time, 1 ms per packet, with the
-    /// writer skipping the packets where `gap` holds.
-    fn stream(r: &Ring, target: usize, ms: usize, gap: impl Fn(usize) -> bool) {
-        let mut out = vec![0; 48 * 6];
-        for i in 0..ms {
-            if !gap(i) {
-                r.write(&[0; 48 * 6]);
-            }
-            r.read_adaptive_pcm24(&mut out, target);
+        // Capture frame 1050 plays playback frame 1010.
+        let got = read(&line, 1050, 10, true);
+        for (i, packet_read) in got.iter().enumerate() {
+            assert_eq!(packet_read, &packet(1010 + i as u64), "capture frame {}", 1050 + i);
         }
+        assert_eq!(line.status(), LineStatus::default());
     }
 
     #[test]
-    fn repeated_stalls_grow_reserve() {
-        const TARGET: usize = 480; // 10 ms
-        let r = Ring::new_framed(48000 * 6, 6);
-        stream(&r, TARGET, 1000, |_| false);
-        assert_eq!(r.status().underruns, 0, "underran while streaming in real time");
-
-        // A one-off stall is recovered at the configured reserve.
-        stream(&r, TARGET, 2000, |i| i < 30);
-        assert_eq!((r.status().underruns, r.status().reserve_frames), (1, TARGET));
-
-        // A second one within a few seconds grows the reserve, and the ring refills to it.
-        stream(&r, TARGET, 2000, |i| i < 30);
-        let status = r.status();
-        assert_eq!((status.underruns, status.reserve_frames), (2, TARGET * 3 / 2));
-        assert!(status.buffered_frames.abs_diff(TARGET * 3 / 2) <= 48, "buffered {} frames", status.buffered_frames);
-
-        // The grown reserve now absorbs the same stall.
-        stream(&r, TARGET, 2000, |i| i < 12);
-        assert_eq!(r.status().underruns, 2);
+    fn frames_without_audio_are_silent_and_counted_only_while_playing() {
+        let line = DelayLine::new(10);
+        write(&line, 1000, 10);
+        // Before the stream: silent, not missing.
+        assert_eq!(read(&line, 1005, 5, true), vec![vec![0; PACKET_BYTES]; 5]);
+        assert_eq!(line.status().missing, 0);
+        // A lost URB: exactly its frames are silent.
+        write(&line, 1020, 10);
+        let got = read(&line, 1015, 20, true);
+        assert_eq!(got[4], packet(1009));
+        assert!(got[5..15].iter().all(|p| p == &vec![0; PACKET_BYTES]));
+        assert_eq!(got[15], packet(1020));
+        assert_eq!(line.status().missing, 10);
+        // Nothing is missing when no playback stream is running.
+        line.end_playback();
+        read(&line, 1040, 10, false);
+        assert_eq!(line.status().missing, 10);
     }
 
     #[test]
-    fn stable_stream_relaxes_reserve() {
-        const TARGET: usize = 480;
-        let r = Ring::new_framed(48000 * 6, 6);
-        stream(&r, TARGET, 1000, |_| false);
-        stream(&r, TARGET, 1000, |i| i < 30);
-        stream(&r, TARGET, 1000, |i| i < 30);
-        assert_eq!(r.status().reserve_frames, 720);
-        stream(&r, TARGET, 119_000, |_| false);
-        assert_eq!(r.status().reserve_frames, 720, "relaxed early");
-        stream(&r, TARGET, 2000, |_| false);
-        assert_eq!(r.status().reserve_frames, TARGET);
+    fn late_stream_is_realigned_instead_of_dropped() {
+        let line = DelayLine::new(20);
+        write(&line, 1000, 10);
+        read(&line, 1020, 10, true); // plays frames 1000-1009
+        read(&line, 1030, 10, true); // frames 1010-1019: nothing arrived
+        // The stream continues contiguously but late: frame 1010 was already
+        // played. It now plays from frame 1030: after the last frame read,
+        // 1019, with half the delay to spare.
+        write(&line, 1010, 10);
+        assert_eq!(line.status().realigned, 1);
+        let gap = read(&line, 1040, 10, true);
+        assert!(gap.iter().all(|p| p == &vec![0; PACKET_BYTES]), "gap before the realigned stream");
+        // Its next URB arrives just as late, so it follows on.
+        write(&line, 1020, 10);
+        let got = read(&line, 1050, 20, true);
+        for (i, packet_read) in got.iter().enumerate() {
+            assert_eq!(packet_read, &packet(1010 + i as u64), "realigned frame {i}");
+        }
+        assert_eq!(line.status(), LineStatus { missing: 20, realigned: 1, caught_up: 0 });
+    }
+
+    /// A stream that was moved later returns to its own frames once it
+    /// catches up, skipping the audio in between, so the latency recovers.
+    #[test]
+    fn caught_up_stream_returns_to_its_own_frames() {
+        let line = DelayLine::new(20);
+        write(&line, 1000, 10);
+        read(&line, 1020, 10, true);
+        read(&line, 1030, 10, true); // frames 1010-1019: nothing arrived
+        write(&line, 1010, 10); // late: moved to frame 1030
+        // While it stays as late, it stays where it was moved.
+        read(&line, 1040, 10, true);
+        write(&line, 1020, 10);
+        assert_eq!(read(&line, 1050, 10, true)[0], packet(1010));
+        assert_eq!(line.status().caught_up, 0);
+
+        // The host catches up: its next URBs arrive well ahead of their frames.
+        // The stream moves back in steps of at least a URB: first as far as
+        // the frames already read allow, then to its own frames.
+        write(&line, 1030, 10);
+        write(&line, 1040, 10);
+        write(&line, 1050, 10);
+        assert_eq!(line.status().caught_up, 2);
+        // Frames 1040-1049 still hold the stream as moved; then it jumps to
+        // its own frames, skipping packets 1030-1049.
+        let got = read(&line, 1060, 20, true);
+        assert_eq!(got[0], packet(1020));
+        assert_eq!(got[10], packet(1050), "back at its own frame");
+        write(&line, 1060, 10);
+        assert_eq!(read(&line, 1080, 1, true)[0], packet(1060), "and stays there");
     }
 
     #[test]
-    fn source_stopping_is_not_a_stall() {
-        const TARGET: usize = 480;
-        let r = Ring::new_framed(48000 * 6, 6);
-        stream(&r, TARGET, 1000, |_| false);
-        // A paused source: playback stops for longer than any stall.
-        stream(&r, TARGET, 3000, |i| i < 1500);
-        stream(&r, TARGET, 3000, |i| i < 1500);
-        let status = r.status();
-        assert_eq!((status.underruns, status.reserve_frames), (0, TARGET));
+    fn a_new_stream_starts_at_its_own_frames() {
+        let line = DelayLine::new(20);
+        write(&line, 1000, 10);
+        read(&line, 1020, 10, true);
+        read(&line, 1030, 10, true);
+        write(&line, 1010, 10); // late: moved 20 frames later
+        // A restarted stream is not contiguous, so it drops the old offset.
+        write(&line, 1100, 10);
+        assert_eq!(read(&line, 1120, 1, true)[0], packet(1100));
     }
 
     #[test]
-    fn overruns_count_only_while_read() {
-        let r = Ring::new_framed(48 * 6 * 20, 6); // 20 ms
-        r.write(&[0; 48 * 6 * 30]);
-        assert_eq!(r.status().overruns, 0, "nothing reads the ring yet");
-        stream(&r, 240, 10, |_| false);
-        r.write(&[0; 48 * 6 * 30]);
-        assert_eq!(r.status().overruns, 1);
+    fn stale_slots_are_not_replayed() {
+        let line = DelayLine::new(10);
+        write(&line, 1000, 10);
+        // The same slot one full cycle later holds a different frame.
+        let later = 1000 + line.slots;
+        assert_eq!(read(&line, later + 10, 1, false)[0], vec![0; PACKET_BYTES]);
     }
 
     #[test]
-    fn ring_round_trip() {
-        let r = Ring::new(16);
-        let input = [1, 2, 3, 4];
-        r.write(&input);
-        let mut out = [0; 4];
-        r.read_silence(&mut out);
-        assert_eq!(out, input);
+    fn unread_audio_is_never_overwritten() {
+        let line = DelayLine::new(10);
+        read(&line, 1010, 1, false); // last read: frame 1000
+        write(&line, 1001, 1);
+        write(&line, 1001 + line.slots, 1); // would land in frame 1001's slot
+        assert_eq!(read(&line, 1011, 1, false)[0], packet(1001));
     }
 
     #[test]
-    fn ring_overrun_keeps_newest() {
-        let r = Ring::new(4);
-        r.write(&[1, 2, 3, 4, 5, 6]);
-        let mut out = [0; 4];
-        r.read_silence(&mut out);
-        assert_eq!(out, [3, 4, 5, 6]);
+    fn short_and_empty_packets() {
+        let line = DelayLine::new(10);
+        let short = vec![7; 100]; // 16 whole PCM frames and a partial one
+        line.write(1000, [short.as_slice(), &[]]);
+        let got = read(&line, 1010, 2, false);
+        assert!(got[0][..96].iter().all(|&b| b == 7) && got[0][96..].iter().all(|&b| b == 0));
+        assert_eq!(got[1], vec![0; PACKET_BYTES], "an empty packet carries no audio");
     }
 
     #[test]
-    fn ring_pads_silence() {
-        let r = Ring::new(4);
-        r.write(&[7, 8]);
-        let mut out = [0; 4];
-        r.read_silence(&mut out);
-        assert_eq!(out, [7, 8, 0, 0]);
+    fn capture_packet_layout_follows_the_lengths() {
+        let line = DelayLine::new(10);
+        write(&line, 1000, 2);
+        let mut out = vec![0xEE; 400];
+        line.read(1010, &mut out, [PACKET_BYTES, 60], false);
+        assert_eq!(&out[..PACKET_BYTES], packet(1000).as_slice());
+        assert_eq!(&out[PACKET_BYTES..PACKET_BYTES + 60], &packet(1001)[..60]);
+        assert!(out[PACKET_BYTES + 60..].iter().all(|&b| b == 0), "the remainder is silence");
     }
 
     #[test]
-    fn frame_ring_overrun_preserves_frame_alignment() {
-        let r = Ring::new_framed(12, 6);
-        r.write(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        r.write(&[13, 14, 15, 16, 17, 18]);
-        let mut out = [0; 12];
-        r.read_silence(&mut out);
-        assert_eq!(out, [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
-    }
-
-    #[test]
-    fn frame_ring_underrun_pads_whole_frames() {
-        let r = Ring::new_framed(12, 6);
-        r.write(&[1, 2, 3, 4, 5, 6]);
-        let mut out = [0; 12];
-        r.read_silence(&mut out);
-        assert_eq!(out, [1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn frame_ring_discards_incomplete_input_tail() {
-        let r = Ring::new_framed(12, 6);
-        assert_eq!(r.write(&[1, 2, 3, 4, 5, 6, 7]), 6);
-        let mut out = [0; 6];
-        r.read_silence(&mut out);
-        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
+    fn gain_scales_samples_and_unity_is_exact() {
+        let line = DelayLine::new(1);
+        let mut samples = Vec::new();
+        for value in [0x40_0000, -0x40_0000, 1, -1, 0x7f_ffff] {
+            let mut b = [0; 3];
+            encode_int24(&mut b, value);
+            samples.extend_from_slice(&b);
+        }
+        samples.resize(PACKET_BYTES, 0);
+        line.write(1000, [samples.as_slice()]);
+        assert_eq!(read(&line, 1001, 1, false)[0], samples, "unity gain");
+        line.set_gain(Gain::Scale(0.5));
+        let half = read(&line, 1001, 1, false).remove(0);
+        let value = |i: usize| decode_int24(half[i * 3], half[i * 3 + 1], half[i * 3 + 2]);
+        assert_eq!((value(0), value(1), value(4)), (0x20_0000, -0x20_0000, 0x40_0000));
+        line.set_gain(Gain::Scale(0.0));
+        assert_eq!(read(&line, 1001, 1, false)[0], vec![0; PACKET_BYTES], "mute");
     }
 
     #[test]

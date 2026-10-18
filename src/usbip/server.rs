@@ -41,6 +41,13 @@ pub struct Server {
     /// Enables the per-URB stream traces and the pipe-reset, unlink and resync
     /// events in the log. Set it before `serve`.
     pub diagnostics: bool,
+    /// When playback URBs complete. Set it before `serve`.
+    pub playback_completion: PlaybackCompletion,
+    /// For troubleshooting: hold every isochronous completion this long once
+    /// a minute, to reproduce a system stall. Set it before `serve`.
+    pub stall_test: Option<Duration>,
+    started: Instant,
+    stall_logged: AtomicU64,
 
     urb_count: AtomicU64,
     control_count: AtomicU64,
@@ -58,6 +65,47 @@ pub struct Server {
     next_connection: AtomicU64,
 }
 
+/// When a playback URB is reported complete.
+///
+/// usbaudio sends each playback URB about a millisecond after an earlier one
+/// completes, keeping one to three queued. Whenever a completion leaves it
+/// nothing queued, it resets the pipe and sends a single URB; it only
+/// recovers when it has more audio ready by then. With one URB in flight,
+/// every completion leaves nothing queued, so after a stall it can keep
+/// resetting the pipe after every URB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaybackCompletion {
+    /// When its last frame has ended, as USB host controllers do.
+    End,
+    /// When its first frame begins, as long as another URB is queued behind
+    /// it, which gives usbaudio a URB's length more time to send the next;
+    /// otherwise when its last frame ends, or as soon as another URB arrives.
+    /// Its audio is already in the delay line and plays at its frames either
+    /// way.
+    #[default]
+    Start,
+}
+
+impl PlaybackCompletion {
+    pub fn parse(text: &str) -> Option<PlaybackCompletion> {
+        match text {
+            "end" => Some(PlaybackCompletion::End),
+            "start" => Some(PlaybackCompletion::Start),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PlaybackCompletion::End => "end",
+            PlaybackCompletion::Start => "start",
+        }
+    }
+}
+
+/// How often the stall test holds the completions.
+const STALL_TEST_PERIOD: Duration = Duration::from_secs(60);
+
 /// An open connection: a clone of its stream, to close it, and the bus ID of
 /// the device it has imported.
 struct Connection {
@@ -72,6 +120,10 @@ impl Server {
             devices: Mutex::new(devices),
             logger,
             diagnostics: false,
+            playback_completion: PlaybackCompletion::default(),
+            stall_test: None,
+            started: Instant::now(),
+            stall_logged: AtomicU64::new(0),
             urb_count: AtomicU64::new(0),
             control_count: AtomicU64::new(0),
             unlink_count: AtomicU64::new(0),
@@ -274,6 +326,7 @@ impl Server {
         writer: Box<dyn Write + Send>,
         device: Arc<Device>,
     ) {
+        let _audio_thread = crate::platform::enter_audio_thread(&self.logger);
         let state = Arc::new(ConnState::new(writer));
         let control_event = Event::new();
         let mut workers: HashMap<u32, EndpointWorker> = HashMap::new();
@@ -331,8 +384,18 @@ impl Server {
                         submit.in_flight = state.iso_state(basic.endpoint, now.frame()).0;
                     }
                     submit.req.start_frame = slot.start_frame;
+                    submit.start = slot.start;
                     submit.complete_at = slot.deadline;
                     submit.complete_frame = slot.end_frame;
+                    if basic.endpoint == 1 && basic.direction == DIRECTION_OUT {
+                        // Playback audio goes into the delay line under its
+                        // frames as soon as it arrives, so it plays at its
+                        // frame however late its URB completes.
+                        device.write_playback(slot.start, iso_payloads(&submit.out, &submit.packets));
+                        if self.playback_completion == PlaybackCompletion::Start {
+                            submit.early_at = Some(now.frame_start(slot.start));
+                        }
+                    }
                     if slot.resynced && self.diagnostics {
                         let count = self.iso_resync_count.fetch_add(1, Ordering::SeqCst) + 1;
                         if count <= 20 || count.is_multiple_of(100) {
@@ -445,48 +508,119 @@ impl Server {
             return fail(submit, STATUS_CONN_RESET);
         }
 
+        let complete = |submit: &ParsedSubmit| {
+            if !req.is_isochronous() {
+                return Ok(());
+            }
+            wait_iso_completion(event, submit.complete_at, submit.complete_frame, &cancelled)?;
+            self.hold_for_stall_test(event, &cancelled)
+        };
+
         match (req.basic.endpoint, req.basic.direction) {
             (1, DIRECTION_OUT) => {
-                // Playback data enters the ring when its frames have been
-                // transmitted, mirroring how capture data leaves it. The ring
-                // level is then the distance between the two schedules on the
-                // same bus clock, rather than also counting however many URBs the
-                // host happens to have queued ahead.
-                if req.is_isochronous()
-                    && wait_iso_completion(event, submit.complete_at, submit.complete_frame, &cancelled).is_err()
-                {
+                // The audio went into the delay line when the URB arrived.
+                let early = match submit.early_at {
+                    Some(early_at) => wait_for_early_completion(
+                        state,
+                        req.basic.endpoint,
+                        event,
+                        early_at,
+                        submit.complete_at,
+                        &cancelled,
+                    ),
+                    None => Ok(false),
+                };
+                let completed = match early {
+                    Ok(true) => self.hold_for_stall_test(event, &cancelled),
+                    Ok(false) => complete(submit)
+                        .and_then(|()| self.break_reset_loop(device, state, req.basic.endpoint, event, &cancelled)),
+                    Err(cancelled) => Err(cancelled),
+                };
+                if completed.is_err() {
                     return fail(submit, STATUS_CONN_RESET);
                 }
-                // Windows can queue the first isochronous request immediately
-                // around SET_INTERFACE. Do not tear down the device for this
-                // harmless race: accept and discard the packet until the playback
-                // interface is active.
-                let mut actual = submit.out.len();
-                if device.playback_active() {
-                    actual = device.write_playback(&submit.out);
-                }
+                let actual = submit.out.len();
                 mark_iso_packets(&mut submit.packets, actual);
                 state.write_submit(submit, STATUS_OK, actual as u32, &[], &submit.packets, 0)
             }
             (2, DIRECTION_IN) => {
-                if req.is_isochronous()
-                    && wait_iso_completion(event, submit.complete_at, submit.complete_frame, &cancelled).is_err()
-                {
+                if complete(submit).is_err() {
                     return fail(submit, STATUS_CONN_RESET);
                 }
                 let length = response_payload_length(&req, &submit.packets);
                 submit.input.resize(length, 0);
-                if device.capture_active() {
-                    device.read_capture(&mut submit.input);
-                    self.report_audio_health(state, device);
+                if submit.packets.is_empty() {
+                    device.read_capture(submit.start, &mut submit.input, [length]);
                 } else {
-                    submit.input.fill(0); // digital silence; the reused buffer holds old audio
+                    let lengths = submit.packets.iter().map(|p| p.length as usize);
+                    device.read_capture(submit.start, &mut submit.input, lengths);
+                }
+                if device.capture_active() {
+                    self.report_audio_health(state, device);
                 }
                 mark_iso_packets(&mut submit.packets, length);
                 state.write_submit(submit, STATUS_OK, length as u32, &submit.input, &submit.packets, 0)
             }
             _ => fail(submit, STATUS_PIPE),
         }
+    }
+
+    /// Breaks usbaudio's reset loop, in which it resets the playback pipe
+    /// after every URB. In the loop it sends a single URB after each reset,
+    /// so its completion always leaves nothing queued. Every time usbaudio
+    /// recovered from a reset by itself, it had first found the pipe idle for
+    /// several frames, and then sent two or more URBs. So when the endpoint is
+    /// in a reset loop and this URB has nothing queued behind it, its
+    /// completion is held for up to `LOOP_BREAK_HOLD`, until another URB
+    /// arrives, at most once per `LOOP_BREAK_INTERVAL_FRAMES`.
+    fn break_reset_loop(
+        &self,
+        device: &Device,
+        state: &ConnState,
+        endpoint: u32,
+        event: &Event,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), Cancelled> {
+        if state.iso_pending(endpoint) > 1 || !state.take_loop_break(endpoint, current_bus_time().frame()) {
+            return Ok(());
+        }
+        if self.diagnostics {
+            logf!(self.logger, "{} LOOP BREAK ep={endpoint}: holding a lone playback URB", device.bus_id);
+        }
+        let until = Instant::now() + LOOP_BREAK_HOLD;
+        while state.iso_pending(endpoint) <= 1 && Instant::now() < until {
+            if cancelled() {
+                return Err(Cancelled);
+            }
+            event.wait(Some(until));
+        }
+        Ok(())
+    }
+
+    /// For the stall test: during the first `stall_test` of every minute after
+    /// the first, waits until that window ends before a URB completes, so the
+    /// host sees every isochronous stream stall at once.
+    fn hold_for_stall_test(&self, event: &Event, cancelled: &dyn Fn() -> bool) -> Result<(), Cancelled> {
+        let Some(length) = self.stall_test else {
+            return Ok(());
+        };
+        let elapsed = self.started.elapsed();
+        let window = (elapsed.as_nanos() / STALL_TEST_PERIOD.as_nanos()) as u64;
+        let into = elapsed - STALL_TEST_PERIOD * window as u32;
+        if window == 0 || into >= length {
+            return Ok(());
+        }
+        if self.stall_logged.swap(window, Ordering::SeqCst) != window {
+            logf!(self.logger, "STALL TEST: holding isochronous completions for {} ms", length.as_millis());
+        }
+        let until = Instant::now() + (length - into);
+        while Instant::now() < until {
+            if cancelled() {
+                return Err(Cancelled);
+            }
+            event.wait(Some(until));
+        }
+        Ok(())
     }
 
     /// Logs the state of an endpoint when the host clears its halt: how many
@@ -555,12 +689,12 @@ impl Server {
         history.push_back(event);
     }
 
-    /// Logs a cable's audio health when it has changed: underruns and
-    /// overruns, the reserve the ring has grown to, and the schedule restarts
-    /// and pipe resets that usually cause them. Unlike the traces, it is always
-    /// on, so the log of a session that went wrong shows why; it adds at most
-    /// one line per `HEALTH_REPORT_INTERVAL`. The first look only records a
-    /// baseline.
+    /// Logs a cable's audio health when it has changed: audio that was
+    /// missing from the recording side, playback that arrived too late, and
+    /// the schedule restarts and pipe resets behind them. Unlike the traces,
+    /// it is always on, so the log of a session that went wrong shows why; it
+    /// adds at most one line per `HEALTH_REPORT_INTERVAL`. The first look only
+    /// records a baseline.
     pub(crate) fn report_audio_health(&self, state: &ConnState, device: &Device) {
         let now = Instant::now();
         let mut report = lock(&state.health);
@@ -568,16 +702,17 @@ impl Server {
             return;
         }
         report.next_check = Some(now + HEALTH_REPORT_INTERVAL);
-        let ring = device.buffer.status();
+        let line = device.audio.status();
         let health = {
             let s = lock(&state.sched);
             Health {
-                underruns: ring.underruns,
-                overruns: ring.overruns,
-                reserve_frames: ring.reserve_frames,
+                missing: line.missing,
+                realigned: line.realigned,
+                caught_up: line.caught_up,
                 playback_resyncs: s.iso_resyncs.get(&1).copied().unwrap_or(0),
                 capture_resyncs: s.iso_resyncs.get(&2).copied().unwrap_or(0),
                 halt_clears: s.halt_clears,
+                loop_breaks: s.loop_breaks,
             }
         };
         let Some(previous) = report.reported.replace(health) else {
@@ -588,19 +723,19 @@ impl Server {
         }
         logf!(
             self.logger,
-            "{} AUDIO HEALTH underruns={} (+{}) overruns={} (+{}) reserve_ms={} configured_reserve_ms={} queue_ms={} rate_correction_ppm={} playback_resyncs={} capture_resyncs={} halt_clears={}",
+            "{} AUDIO HEALTH missing_ms={} (+{}) realigned={} (+{}) caught_up={} (+{}) latency_ms={} playback_resyncs={} capture_resyncs={} halt_clears={} loop_breaks={}",
             device.bus_id,
-            health.underruns,
-            health.underruns - previous.underruns,
-            health.overruns,
-            health.overruns - previous.overruns,
-            health.reserve_frames / 48,
-            device.reserve_frames() / 48,
-            ring.buffered_frames / 48,
-            ring.correction_ppm,
+            health.missing,
+            health.missing - previous.missing,
+            health.realigned,
+            health.realigned - previous.realigned,
+            health.caught_up,
+            health.caught_up - previous.caught_up,
+            device.audio.delay(),
             health.playback_resyncs,
             health.capture_resyncs,
-            health.halt_clears
+            health.halt_clears,
+            health.loop_breaks
         );
     }
 
@@ -626,13 +761,13 @@ impl Server {
         }
         let count = self.urb_count.fetch_add(1, Ordering::SeqCst) + 1;
         if count <= 20 || count.is_multiple_of(250) {
-            let (available, dropped, underruns) = device.buffer.stats();
+            let line = device.audio.status();
             let now = current_bus_time();
             let unaligned_packets = submit.packets.iter().filter(|p| p.length % 6 != 0).count();
             let frame = now.frame() as u32;
             logf!(
                 self.logger,
-                "{} URB #{count} seq={} ep={} dir={} bytes={} iso_packets={} playback_active={} capture_active={} queue_ms={} rate_correction_ppm={} dropped_bytes={dropped} underrun_bytes={underruns} unaligned_iso_packets={unaligned_packets} out_tail_bytes={} start_frame={} lead_frames={} bus_lag_us={} flags=0x{:x} host_start_frame={} host_lead_frames={} in_flight={}",
+                "{} URB #{count} seq={} ep={} dir={} bytes={} iso_packets={} playback_active={} capture_active={} missing_ms={} realigned={} caught_up={} unaligned_iso_packets={unaligned_packets} out_tail_bytes={} start_frame={} lead_frames={} bus_lag_us={} flags=0x{:x} host_start_frame={} host_lead_frames={} in_flight={}",
                 device.bus_id,
                 req.basic.sequence,
                 req.basic.endpoint,
@@ -641,8 +776,9 @@ impl Server {
                 packet_count_name(req.number_of_packets),
                 device.playback_active(),
                 device.capture_active(),
-                available / 288,
-                device.buffer.correction_ppm(),
+                line.missing,
+                line.realigned,
+                line.caught_up,
                 submit.out.len() % 6,
                 req.start_frame,
                 req.start_frame.wrapping_sub(frame) as i32,
@@ -767,12 +903,13 @@ struct HealthReport {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Health {
-    underruns: u64,
-    overruns: u64,
-    reserve_frames: usize,
+    missing: u64,
+    realigned: u64,
+    caught_up: u64,
     playback_resyncs: u64,
     capture_resyncs: u64,
     halt_clears: u64,
+    loop_breaks: u64,
 }
 
 struct WriterState {
@@ -790,7 +927,29 @@ struct Schedule {
     /// health report.
     iso_resyncs: HashMap<u32, u64>,
     halt_clears: u64,
+    /// Recent halt clears by endpoint, to detect usbaudio's reset loop.
+    reset_runs: HashMap<u32, ResetRun>,
+    /// When the loop breaker last held a completion, and how often it has.
+    last_loop_break: Option<u64>,
+    loop_breaks: u64,
 }
+
+/// A run of halt clears on an endpoint, each within `RESET_LOOP_FRAMES` of
+/// the one before.
+#[derive(Clone, Copy)]
+struct ResetRun {
+    last_frame: u64,
+    length: u32,
+}
+
+/// Halt clears this close together, in frames, belong to one reset loop.
+const RESET_LOOP_FRAMES: u64 = 30;
+/// How many halt clears in a row make a reset loop.
+const RESET_LOOP_LENGTH: u32 = 3;
+/// How long the loop breaker holds a lone playback URB's completion.
+const LOOP_BREAK_HOLD: Duration = Duration::from_millis(10);
+/// The loop breaker holds a completion at most once per this many frames.
+const LOOP_BREAK_INTERVAL_FRAMES: u64 = 1000;
 
 /// How far the schedule of a reset pipe may have fallen behind the bus clock
 /// and still be continued. A host that resubmits within this window is still
@@ -813,6 +972,9 @@ const MAX_ISO_LATE_FRAMES: u64 = 1024;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IsoSlot {
     pub start_frame: u32,
+    /// The full bus frame number of the first packet; `start_frame` is its
+    /// low 32 bits, as USB/IP carries it.
+    pub start: u64,
     /// The frame after the last packet; the URB completes when the bus clock
     /// reaches it.
     pub end_frame: u64,
@@ -900,7 +1062,33 @@ impl ConnState {
     pub(crate) fn clear_endpoint_halt(&self, endpoint: u32, now: BusTime) {
         let mut s = lock(&self.sched);
         s.halt_clears += 1;
-        s.rewind_iso_timeline(endpoint, now.frame());
+        let frame = now.frame();
+        let run = s.reset_runs.entry(endpoint).or_insert(ResetRun { last_frame: 0, length: 0 });
+        let continues = run.length > 0 && frame <= run.last_frame + RESET_LOOP_FRAMES;
+        run.length = if continues { run.length + 1 } else { 1 };
+        run.last_frame = frame;
+        s.rewind_iso_timeline(endpoint, frame);
+    }
+
+    /// Whether the endpoint is in a reset loop, at bus frame `frame`, and the
+    /// loop breaker may hold a completion now; if so, records that it does.
+    pub(crate) fn take_loop_break(&self, endpoint: u32, frame: u64) -> bool {
+        let mut s = lock(&self.sched);
+        let in_loop = s
+            .reset_runs
+            .get(&endpoint)
+            .is_some_and(|run| run.length >= RESET_LOOP_LENGTH && frame <= run.last_frame + RESET_LOOP_FRAMES);
+        if !in_loop || s.last_loop_break.is_some_and(|at| frame < at + LOOP_BREAK_INTERVAL_FRAMES) {
+            return false;
+        }
+        s.last_loop_break = Some(frame);
+        s.loop_breaks += 1;
+        true
+    }
+
+    /// How many URBs are pending on an endpoint.
+    pub(crate) fn iso_pending(&self, endpoint: u32) -> i64 {
+        lock(&self.sched).iso_pending.get(&endpoint).copied().unwrap_or(0)
     }
 
     /// Reports how many URBs are pending on an endpoint and how far its next
@@ -925,6 +1113,7 @@ impl ConnState {
         if packets == 0 {
             return IsoSlot {
                 start_frame: now.frame() as u32,
+                start: now.frame(),
                 end_frame: 0,
                 deadline: Some(now.wall),
                 resynced: false,
@@ -947,7 +1136,7 @@ impl ConnState {
         }
         let end = start + packets as u64;
         s.iso_next.insert(endpoint, end);
-        IsoSlot { start_frame: start as u32, end_frame: end, deadline: Some(now.frame_start(end)), resynced }
+        IsoSlot { start_frame: start as u32, start, end_frame: end, deadline: Some(now.frame_start(end)), resynced }
     }
 
     /// Sends RET_SUBMIT for a URB. Asynchronous URBs are claimed first: if an
@@ -1061,8 +1250,13 @@ pub(crate) struct ParsedSubmit {
     pub packets: Vec<IsoPacket>,
     /// The IN payload; its contents are stale until written.
     pub input: Vec<u8>,
+    /// The bus frame of the first packet, once scheduled.
+    pub start: u64,
     pub complete_at: Option<Instant>,
     pub complete_frame: u64,
+    /// For a playback URB with `PlaybackCompletion::Start`: when its first
+    /// frame begins, the earliest it may complete.
+    pub early_at: Option<Instant>,
     /// Tracked URBs are registered as pending and may be unlinked.
     pub tracked: bool,
     /// The start frame the host requested, before scheduling replaces it. It is
@@ -1085,7 +1279,9 @@ impl ParsedSubmit {
             packets: buffers.packets,
             input: buffers.input,
             complete_at: None,
+            start: 0,
             complete_frame: 0,
+            early_at: None,
             tracked: false,
             host_start_frame: 0,
             in_flight: 0,
@@ -1181,6 +1377,7 @@ impl EndpointWorker {
 
 impl WorkerShared {
     fn run(&self, server: &Server, state: &ConnState, device: &Device) {
+        let _audio_thread = crate::platform::enter_audio_thread(&server.logger);
         loop {
             let job = lock(&self.queue).pop_front();
             let Some(mut job) = job else {
@@ -1262,6 +1459,48 @@ fn wait_iso_completion(
     wait_bus_frame(event, end_frame, cancelled)
 }
 
+/// For a playback URB completed at its first frame: waits for that frame,
+/// then for as long as no other URB is queued behind it, until `end_at`.
+/// Returns whether it may complete before its last frame ends.
+///
+/// usbaudio resets the pipe whenever a completion leaves it nothing queued,
+/// and after a reset it sends a single URB. Completing that URB at its first
+/// frame would leave nothing queued again within a millisecond, so usbaudio
+/// would reset the pipe every few milliseconds; a URB with nothing behind it
+/// waits for its last frame, as a host controller would complete it.
+fn wait_for_early_completion(
+    state: &ConnState,
+    endpoint: u32,
+    event: &Event,
+    early_at: Instant,
+    end_at: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, Cancelled> {
+    while Instant::now() < early_at {
+        if cancelled() {
+            return Err(Cancelled);
+        }
+        event.wait(Some(early_at));
+    }
+    loop {
+        // The pending count includes this URB.
+        if state.iso_pending(endpoint) > 1 {
+            return Ok(true);
+        }
+        let Some(end_at) = end_at else {
+            return Ok(false);
+        };
+        if Instant::now() >= end_at {
+            return Ok(false);
+        }
+        if cancelled() {
+            return Err(Cancelled);
+        }
+        // A new URB on the endpoint signals the event.
+        event.wait(Some(end_at));
+    }
+}
+
 fn response_payload_length(req: &SubmitRequest, packets: &[IsoPacket]) -> usize {
     if packets.is_empty() {
         return req.transfer_buffer_length as usize;
@@ -1271,6 +1510,15 @@ fn response_payload_length(req: &SubmitRequest, packets: &[IsoPacket]) -> usize 
         total = req.transfer_buffer_length as u64;
     }
     total.min(MAX_TRANSFER_LENGTH as u64) as usize
+}
+
+/// The payload of each packet of an isochronous OUT URB, one per frame. A
+/// packet whose descriptor lies outside the payload is empty.
+fn iso_payloads<'a>(out: &'a [u8], packets: &'a [IsoPacket]) -> impl Iterator<Item = &'a [u8]> + 'a {
+    packets.iter().map(move |p| {
+        let start = p.offset as usize;
+        start.checked_add(p.length as usize).and_then(|end| out.get(start..end)).unwrap_or(&[])
+    })
 }
 
 pub(crate) fn mark_iso_packets(packets: &mut [IsoPacket], actual_total: usize) {

@@ -12,7 +12,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::logf;
 use crate::logging::Logger;
-use crate::uac1::DEFAULT_RESERVE_MS;
+use crate::uac1::{DEFAULT_LATENCY_MS, MAX_LATENCY_MS, MIN_LATENCY_MS};
 
 pub const MAX_CABLES: usize = 32;
 /// Cable IDs fit the USB product IDs 0xCA01-0xCAFF.
@@ -21,7 +21,6 @@ pub const MAX_CABLE_NAME: usize = 64;
 /// Built-in settings, used when neither config.toml nor a command-line flag
 /// sets a value.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:3240";
-pub const DEFAULT_BUFFER_MS: i64 = 250;
 
 /// The file name of the configuration.
 pub const CONFIG_FILE: &str = "config.toml";
@@ -251,12 +250,17 @@ pub fn default_config_content() -> String {
         String::new(),
         "# Address of the local USB/IP server.".to_string(),
         format!("listen = \"{DEFAULT_LISTEN}\""),
-        "# Ring-buffer capacity per cable, 20-2000 ms.".to_string(),
-        format!("buffer_ms = {DEFAULT_BUFFER_MS}"),
-        "# Audio kept buffered against scheduling hiccups, from 10 ms to half of buffer_ms.".to_string(),
-        format!("reserve_ms = {DEFAULT_RESERVE_MS}"),
+        format!("# Delay between each cable's playback and recording sides, {MIN_LATENCY_MS}-{MAX_LATENCY_MS} ms."),
+        "# Playback that Windows sends later than this plays after a short gap.".to_string(),
+        format!("latency_ms = {DEFAULT_LATENCY_MS}"),
+        "# When playback transfers complete: \"start\" of their first frame, which gives".to_string(),
+        "# Windows time to send the next one, or \"end\" of their last, as USB hardware does.".to_string(),
+        "playback_completion = \"start\"".to_string(),
         "# Detailed USB/IP traces in the log, for troubleshooting.".to_string(),
         "diagnostics = false".to_string(),
+        "# For troubleshooting: hold all audio transfers this many milliseconds once a".to_string(),
+        "# minute, to reproduce a system stall. 0 turns it off.".to_string(),
+        "stall_test_ms = 0".to_string(),
     ]
     .iter()
     .map(|line| format!("{line}\n"))
@@ -351,20 +355,21 @@ pub(crate) mod tests {
     #[test]
     fn reads_typed_settings() {
         let config = parse_config(
-            "# comment\nreserve_ms = 30\nbuffer_ms = 250\ndiagnostics = true\nlisten = \"0.0.0.0:4000\"\n",
+            "# comment\nlatency_ms = 30\nstall_test_ms = 250\ndiagnostics = true\nlisten = \"0.0.0.0:4000\"\n",
         )
         .unwrap();
-        assert_eq!(config_int(&config, "reserve_ms", 40), 30);
-        assert_eq!(config_int(&config, "buffer_ms", 1), 250);
+        assert_eq!(config_int(&config, "latency_ms", 40), 30);
+        assert_eq!(config_int(&config, "stall_test_ms", 1), 250);
         assert!(config_bool(&config, "diagnostics", false));
         assert_eq!(config_string(&config, "listen", DEFAULT_LISTEN), "0.0.0.0:4000");
 
         // Settings of the wrong type fall back, as do missing ones.
-        let config = parse_config("buffer_ms = \"250\"\ndiagnostics = 1\nlisten = 3240\nreserve_ms = 1.5\n").unwrap();
-        assert_eq!(config_int(&config, "buffer_ms", 99), 99);
+        let config =
+            parse_config("stall_test_ms = \"250\"\ndiagnostics = 1\nlisten = 3240\nlatency_ms = 1.5\n").unwrap();
+        assert_eq!(config_int(&config, "stall_test_ms", 99), 99);
         assert!(!config_bool(&config, "diagnostics", false));
         assert_eq!(config_string(&config, "listen", DEFAULT_LISTEN), DEFAULT_LISTEN);
-        assert_eq!(config_int(&config, "reserve_ms", 40), 40);
+        assert_eq!(config_int(&config, "latency_ms", 40), 40);
         assert_eq!(config_string(&parse_config("listen = \"\"").unwrap(), "listen", DEFAULT_LISTEN), DEFAULT_LISTEN);
         assert_eq!(config_int(&Config::default(), "missing", 7), 7);
     }
@@ -394,8 +399,9 @@ pub(crate) mod tests {
         assert_eq!(written, default_config_content());
         let config = parse_config(&written).unwrap();
         assert_eq!(config_string(&config, "listen", ""), DEFAULT_LISTEN);
-        assert_eq!(config_int(&config, "buffer_ms", 0), DEFAULT_BUFFER_MS);
-        assert_eq!(config_int(&config, "reserve_ms", 0), DEFAULT_RESERVE_MS);
+        assert_eq!(config_int(&config, "latency_ms", 0), DEFAULT_LATENCY_MS);
+        assert_eq!(config_string(&config, "playback_completion", ""), "start");
+        assert_eq!(config_int(&config, "stall_test_ms", 1), 0);
         assert!(!config_bool(&config, "diagnostics", true));
         assert_eq!(config_cables(&config), []);
 
@@ -405,7 +411,7 @@ pub(crate) mod tests {
         assert_eq!(fs::read_to_string(config_file_path()).unwrap(), "listen = \"x\"\n");
 
         // Saving the cables keeps the comments and the other settings.
-        let mine = "# mine\nlisten = \"127.0.0.1:4000\" # my port\nreserve_ms = 30\n\n";
+        let mine = "# mine\nlisten = \"127.0.0.1:4000\" # my port\nlatency_ms = 30\n\n";
         fs::write(config_file_path(), format!("{mine}{}", cable_table("1", "\"VCABLE-001\"", "\"Virtual Cable 01\"")))
             .unwrap();
         let cables = [Cable::numbered(1), cable(3, "8F3A2C1D", "Game")];

@@ -4,7 +4,7 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{raise_process_priority, run_attach_broker, run_gui, show_fatal_dialog};
+pub use windows::{enter_audio_thread, raise_process_priority, run_attach_broker, run_gui, show_fatal_dialog};
 
 #[cfg(not(windows))]
 mod other {
@@ -14,6 +14,12 @@ mod other {
     use crate::logging::Logger;
 
     pub fn raise_process_priority(_: &Logger) {}
+
+    pub struct AudioThread;
+
+    pub fn enter_audio_thread(_: &Logger) -> AudioThread {
+        AudioThread
+    }
 
     /// There is no window outside Windows: serve until the process is stopped.
     pub fn run_gui(_: &Arc<AppServer>) {
@@ -31,4 +37,4 @@ mod other {
     }
 }
 #[cfg(not(windows))]
-pub use other::{raise_process_priority, run_attach_broker, run_gui, show_fatal_dialog};
+pub use other::{enter_audio_thread, raise_process_priority, run_attach_broker, run_gui, show_fatal_dialog};

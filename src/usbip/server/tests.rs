@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::audio::LineStatus;
 use crate::uac1::{
-    DEFAULT_RESERVE_MS, Device, REQUEST_CLEAR_FEATURE, REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE,
+    DEFAULT_LATENCY_MS, Device, REQUEST_CLEAR_FEATURE, REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE,
 };
 use crate::usbip::busclock::TICKS_PER_FRAME;
 
@@ -170,7 +171,7 @@ fn set_interface_restarts_idle_iso_timeline() {
 
 #[test]
 fn device_list_encoding() {
-    let dev = Arc::new(Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap());
+    let dev = Arc::new(Device::new(1, DEFAULT_LATENCY_MS).unwrap());
     let s = Server::new("127.0.0.1:0", vec![dev], Logger::discard());
     let b = s.device_list();
     // 8-byte OP header, 4-byte count, 312-byte device, 12-byte interfaces.
@@ -181,7 +182,7 @@ fn device_list_encoding() {
 
 #[test]
 fn diagnostic_traces_follow_setting() {
-    let dev = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+    let dev = Device::new(1, DEFAULT_LATENCY_MS).unwrap();
     let submit = ParsedSubmit::from_request(SubmitRequest {
         basic: BasicHeader { endpoint: 1, ..Default::default() },
         number_of_packets: 10,
@@ -205,7 +206,7 @@ fn diagnostic_traces_follow_setting() {
 /// before it, then the next ones as they happen.
 #[test]
 fn iso_trace_surrounds_logged_pipe_reset() {
-    let dev = Device::new(1, 100, DEFAULT_RESERVE_MS).unwrap();
+    let dev = Device::new(1, DEFAULT_LATENCY_MS).unwrap();
     let state = discard_state();
     let (logger, out) = Logger::memory();
     let mut s = Server::new("", Vec::new(), logger);
@@ -246,7 +247,7 @@ fn iso_trace_surrounds_logged_pipe_reset() {
 /// line, and adds at most one line per interval.
 #[test]
 fn audio_health_reports_changes() {
-    let device = active_device(500);
+    let device = active_device(DEFAULT_LATENCY_MS);
     let state = discard_state();
     let (logger, out) = Logger::memory();
     let s = Server::new("", Vec::new(), logger);
@@ -267,7 +268,10 @@ fn audio_health_reports_changes() {
     s.report_audio_health(&state, &device);
     let logged = lines();
     assert_eq!(logged.lines().count(), 1, "{logged}");
-    assert!(logged.contains("1-1 AUDIO HEALTH underruns=0 (+0)"), "{logged}");
+    assert!(
+        logged.contains("1-1 AUDIO HEALTH missing_ms=0 (+0) realigned=0 (+0) caught_up=0 (+0) latency_ms=40"),
+        "{logged}"
+    );
     assert!(logged.contains("playback_resyncs=1 capture_resyncs=0 halt_clears=1"), "{logged}");
 }
 
@@ -346,15 +350,19 @@ fn socket_pair() -> (TcpStream, TcpStream) {
 }
 
 fn start_session(device: Arc<Device>, server_side: TcpStream) -> std::thread::JoinHandle<()> {
-    let server = Arc::new(Server::new("", vec![Arc::clone(&device)], Logger::discard()));
+    start_session_with(Server::new("", vec![Arc::clone(&device)], Logger::discard()), device, server_side)
+}
+
+fn start_session_with(server: Server, device: Arc<Device>, server_side: TcpStream) -> std::thread::JoinHandle<()> {
+    let server = Arc::new(server);
     std::thread::spawn(move || {
         let reader = ConnReader::new(server_side.try_clone().unwrap(), 64 * 1024);
         server.handle_urbs(reader, Box::new(server_side), device);
     })
 }
 
-fn active_device(buffer_ms: i64) -> Arc<Device> {
-    let device = Device::new(1, buffer_ms, DEFAULT_RESERVE_MS).unwrap();
+fn active_device(latency_ms: i64) -> Arc<Device> {
+    let device = Device::new(1, latency_ms).unwrap();
     device.handle_control(SetupPacket { request: REQUEST_SET_CONFIGURATION, value: 1, ..Default::default() }, &[]);
     for iface in [1, 2] {
         let setup =
@@ -372,33 +380,47 @@ struct RetSubmit {
     start_frame: u32,
     packets: u32,
     error_count: u32,
+    /// The IN payload.
+    data: Vec<u8>,
 }
 
 fn read_reply(r: &mut impl Read, in_length: impl Fn(u32) -> usize) -> io::Result<RetSubmit> {
     let mut header = [0u8; 48];
     r.read_exact(&mut header)?;
-    let reply = RetSubmit {
+    let mut reply = RetSubmit {
         command: be32(&header, 0),
         seq: be32(&header, 4),
         status: be32(&header, 20) as i32,
         start_frame: be32(&header, 28),
         packets: be32(&header, 32),
         error_count: be32(&header, 36),
+        data: Vec::new(),
     };
     if reply.command == RET_SUBMIT {
         let payload = if reply.status == 0 { in_length(reply.seq) } else { 0 };
         let mut rest = vec![0u8; payload + reply.packets as usize * 16];
         r.read_exact(&mut rest)?;
+        rest.truncate(payload);
+        reply.data = rest;
     }
     Ok(reply)
 }
 
+/// The playback packet numbered `n` in the streaming test: distinct for every
+/// packet, and never all zero, so it cannot be mistaken for silence.
+fn numbered_packet(n: u32) -> Vec<u8> {
+    let mut packet = vec![(n % 251) as u8 + 1; 288];
+    packet[..4].copy_from_slice(&n.to_le_bytes());
+    packet
+}
+
 /// Drives a full-duplex stream as Windows does, keeping several 10 ms URBs
-/// queued per endpoint, and checks that each endpoint advances contiguously on
-/// the bus frame clock while the ring holds a steady level without underruns.
+/// queued per endpoint. Each endpoint advances contiguously on the bus frame
+/// clock, and the recording side returns the playback audio bit for bit,
+/// exactly the cable's latency later, with nothing missing.
 #[test]
-fn streaming_schedule_on_bus_clock() {
-    let device = active_device(500);
+fn streaming_loops_audio_back_unchanged() {
+    let device = active_device(DEFAULT_LATENCY_MS);
     let (mut host, server_side) = socket_pair();
     let session = start_session(Arc::clone(&device), server_side);
 
@@ -407,12 +429,20 @@ fn streaming_schedule_on_bus_clock() {
     let in_lengths = Arc::new(Mutex::new(HashMap::<u32, usize>::new()));
     let endpoint_of = std::cell::RefCell::new(HashMap::new());
     let mut seq = 1u32;
+    let mut played = 0u32;
     let mut submit = |host: &mut TcpStream, direction: u32, endpoint: u32| {
+        let mut urb = iso_submit(seq, direction, endpoint, 10);
         if direction == DIRECTION_IN {
             in_lengths.lock().unwrap().insert(seq, 2880);
+        } else {
+            // The payload follows the 48-byte header.
+            for packet in urb[48..48 + 2880].chunks_mut(288) {
+                played += 1;
+                packet.copy_from_slice(&numbered_packet(played));
+            }
         }
         endpoint_of.borrow_mut().insert(seq, endpoint);
-        host.write_all(&iso_submit(seq, direction, endpoint, 10)).unwrap();
+        host.write_all(&urb).unwrap();
         seq += 1;
     };
 
@@ -435,6 +465,9 @@ fn streaming_schedule_on_bus_clock() {
         *submitted.get_mut(&2).unwrap() += 1;
     }
     let mut next_frame = HashMap::new();
+    let mut first_played_frame = None;
+    // Each captured packet with the bus frame it was captured on.
+    let mut captured = Vec::new();
     let mut completed = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     while completed < 2 * URBS {
@@ -447,6 +480,13 @@ fn streaming_schedule_on_bus_clock() {
             assert_eq!(reply.start_frame, want, "ep {endpoint} start_frame not contiguous");
         }
         next_frame.insert(endpoint, reply.start_frame + reply.packets);
+        if endpoint == 1 {
+            first_played_frame.get_or_insert(reply.start_frame);
+        } else {
+            for (i, packet) in reply.data.chunks(288).enumerate() {
+                captured.push((reply.start_frame + i as u32, packet.to_vec()));
+            }
+        }
         completed += 1;
         if submitted[&endpoint] < URBS {
             let direction = if endpoint == 2 { DIRECTION_IN } else { DIRECTION_OUT };
@@ -455,36 +495,180 @@ fn streaming_schedule_on_bus_clock() {
         }
     }
 
-    let (available, dropped, underruns) = device.buffer.stats();
-    assert_eq!(dropped, 0, "dropped bytes");
-    // Capture starts once the reserve is filled; from then on both endpoints
-    // run on the same clock, so the level stays near the target.
-    assert_eq!(underruns, 0, "underran, ring at {} ms", available / 288);
-    let reserve_ms = device.reserve_frames() / 48;
-    let ms = available / 288;
-    assert!(
-        ms + 20 >= reserve_ms && ms <= reserve_ms + 30,
-        "ring level {ms} ms, want near the {reserve_ms} ms reserve"
-    );
+    // Silence until the latency has passed, then every playback packet in
+    // order, starting exactly the latency after the first was played.
+    let start = captured.iter().position(|(_, p)| p.iter().any(|&b| b != 0)).expect("no audio came back");
+    let first_played_frame = first_played_frame.unwrap();
+    assert_eq!(captured[start].0.wrapping_sub(first_played_frame), DEFAULT_LATENCY_MS as u32, "latency in frames");
+    let looped = &captured[start..];
+    assert!(looped.len() > 300, "only {} packets came back", looped.len());
+    for (n, (frame, packet)) in looped.iter().enumerate() {
+        assert!(packet == &numbered_packet(n as u32 + 1), "packet {} captured on frame {frame} differs", n + 1);
+    }
+    assert_eq!(device.audio.status(), LineStatus::default(), "missing audio or realignments");
 
     host.shutdown(std::net::Shutdown::Both).unwrap();
     session.join().unwrap();
+}
+
+/// Sends playback URBs of the given packet counts back to back, and returns
+/// how long the first took to complete, in ms.
+fn first_playback_completion_ms(completion: PlaybackCompletion, urbs: &[u32]) -> u64 {
+    let device = active_device(DEFAULT_LATENCY_MS);
+    let (mut host, server_side) = socket_pair();
+    let mut server = Server::new("", vec![Arc::clone(&device)], Logger::discard());
+    server.playback_completion = completion;
+    let session = start_session_with(server, Arc::clone(&device), server_side);
+    let started = Instant::now();
+    for (seq, &packets) in (1..).zip(urbs) {
+        host.write_all(&iso_submit(seq, DIRECTION_OUT, 1, packets)).unwrap();
+    }
+    let reply = read_reply(&mut host, |_| 0).unwrap();
+    let took = started.elapsed().as_millis() as u64;
+    assert_eq!((reply.command, reply.seq, reply.status), (RET_SUBMIT, 1, 0), "{completion:?}");
+    host.shutdown(std::net::Shutdown::Both).unwrap();
+    session.join().unwrap();
+    took
+}
+
+/// With `PlaybackCompletion::Start`, a playback URB completes when its first
+/// frame begins, but only while another URB is queued behind it; one with
+/// nothing behind it completes after its last frame, as with `End`.
+#[test]
+fn playback_completes_at_its_first_frame_only_with_another_queued() {
+    // 255 packets: completing after the last frame takes a quarter second.
+    let took = first_playback_completion_ms(PlaybackCompletion::Start, &[255, 10]);
+    assert!(took <= 60, "with a URB queued behind, completed after {took} ms");
+    let took = first_playback_completion_ms(PlaybackCompletion::Start, &[255]);
+    assert!(took >= 250, "with nothing queued behind, completed after only {took} ms");
+    let took = first_playback_completion_ms(PlaybackCompletion::End, &[255, 10]);
+    assert!(took >= 250, "completed at the end after only {took} ms");
+}
+
+/// After a pipe reset, usbaudio sends one playback URB, and resets the pipe
+/// again whenever a completion leaves nothing queued. A host that sends one
+/// URB at a time must therefore still see each complete after its last
+/// frame: completed at its first, usbaudio reset the pipe every 2 ms.
+#[test]
+fn one_playback_urb_at_a_time_completes_after_its_last_frame() {
+    let device = active_device(DEFAULT_LATENCY_MS);
+    let (mut host, server_side) = socket_pair();
+    let session = start_session(Arc::clone(&device), server_side);
+    for seq in 1..=6 {
+        host.write_all(&iso_submit(seq, DIRECTION_OUT, 1, 10)).unwrap();
+        let reply = read_reply(&mut host, |_| 0).unwrap();
+        let completed_on = current_bus_time().frame() as u32;
+        assert_eq!((reply.seq, reply.status), (seq, 0));
+        let end = reply.start_frame + reply.packets;
+        assert!(
+            completed_on.wrapping_sub(end) as i32 >= 0,
+            "URB {seq} completed on frame {completed_on}, before {end}"
+        );
+    }
+    host.shutdown(std::net::Shutdown::Both).unwrap();
+    session.join().unwrap();
+}
+
+/// Three or more halt clears within a few frames of each other are a reset
+/// loop, and the loop breaker may act on one at most once a second.
+#[test]
+fn reset_loop_is_detected_and_breaks_are_rate_limited() {
+    let state = discard_state();
+    let clear = |frame| state.clear_endpoint_halt(1, test_bus_time(frame));
+    // Resets spread out: recoveries, not a loop.
+    for frame in [1000, 1100, 1200] {
+        clear(frame);
+    }
+    assert!(!state.take_loop_break(1, 1210));
+    // Resets every 10 frames: a loop.
+    for frame in [2000, 2010] {
+        clear(frame);
+    }
+    assert!(!state.take_loop_break(1, 2015), "two resets are not yet a loop");
+    clear(2020);
+    assert!(state.take_loop_break(1, 2025));
+    clear(2030);
+    assert!(!state.take_loop_break(1, 2035), "at most once a second");
+    for frame in (3030..=3060).step_by(10) {
+        clear(frame);
+    }
+    assert!(state.take_loop_break(1, 3065));
+    assert!(!state.take_loop_break(1, 5000) && lock(&state.sched).loop_breaks == 2, "the loop ended");
+}
+
+/// In a reset loop, a lone playback URB's completion is held for up to
+/// `LOOP_BREAK_HOLD`, and released as soon as another URB is queued.
+#[test]
+fn loop_breaker_holds_a_lone_urb_until_another_arrives() {
+    let device = active_device(DEFAULT_LATENCY_MS);
+    let server = Server::new("", Vec::new(), Logger::discard());
+    let event = Event::new();
+    let state = discard_state();
+    let held = |state: &ConnState| {
+        let started = Instant::now();
+        server.break_reset_loop(&device, state, 1, &event, &|| false).unwrap();
+        started.elapsed()
+    };
+    state.add_pending(1, 1, token());
+    assert!(held(&state) < Duration::from_millis(5), "held outside a loop");
+
+    let now = current_bus_time().frame();
+    for frame in [now - 20, now - 10, now] {
+        state.clear_endpoint_halt(1, test_bus_time(frame));
+    }
+    assert!(held(&state) >= Duration::from_millis(9), "a lone URB in a loop was not held");
+
+    // The next break, a second later, ends as soon as another URB is queued.
+    lock(&state.sched).last_loop_break = None;
+    let took = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(3));
+            state.add_pending(2, 1, token());
+            event.signal();
+        });
+        held(&state)
+    });
+    assert!(took < Duration::from_millis(9), "held for {took:?} after another URB was queued");
+}
+
+/// The stall test holds every isochronous completion for its length once a
+/// minute, after the first minute.
+#[test]
+fn stall_test_holds_completions() {
+    let (logger, out) = Logger::memory();
+    let mut server = Server::new("", Vec::new(), logger);
+    let event = Event::new();
+    server.stall_test = Some(Duration::from_millis(40));
+    let held = |server: &Server| {
+        let started = Instant::now();
+        server.hold_for_stall_test(&event, &|| false).unwrap();
+        started.elapsed()
+    };
+    assert!(held(&server) < Duration::from_millis(10), "held during the first minute");
+    server.started = Instant::now() - STALL_TEST_PERIOD;
+    assert!(held(&server) >= Duration::from_millis(35), "did not hold at the start of a minute");
+    assert!(String::from_utf8(out.lock().unwrap().clone()).unwrap().contains("STALL TEST"));
+    assert!(held(&server) < Duration::from_millis(10), "held after the stall ended");
+    server.stall_test = None;
+    server.started = Instant::now() - STALL_TEST_PERIOD;
+    assert!(held(&server) < Duration::from_millis(10), "held while turned off");
 }
 
 /// An UNLINK must wake the endpoint worker waiting on the URB's frames: the
 /// host gets RET_UNLINK at once and never a RET_SUBMIT for it.
 #[test]
 fn unlink_interrupts_waiting_urb() {
-    let device = active_device(500);
+    let device = active_device(DEFAULT_LATENCY_MS);
     let (mut host, server_side) = socket_pair();
     let session = start_session(device, server_side);
 
-    // 255 packets: the URB would otherwise complete a quarter second later.
-    host.write_all(&iso_submit(1, DIRECTION_OUT, 1, 255)).unwrap();
+    // A 255-packet capture URB would otherwise complete a quarter second
+    // later. (Playback URBs complete at their first frame.)
+    host.write_all(&iso_submit(1, DIRECTION_IN, 2, 255)).unwrap();
     std::thread::sleep(Duration::from_millis(20));
     let started = Instant::now();
     let mut unlink = Vec::new();
-    for v in [CMD_UNLINK, 2, 0x10001, DIRECTION_OUT, 1, 1] {
+    for v in [CMD_UNLINK, 2, 0x10001, DIRECTION_IN, 2, 1] {
         unlink.extend_from_slice(&v.to_be_bytes());
     }
     unlink.extend_from_slice(&[0; 24]);
@@ -510,7 +694,7 @@ fn unlink_interrupts_waiting_urb() {
 /// `serve` and open sessions.
 #[test]
 fn cables_are_added_and_removed_while_serving() {
-    let device = |number| Arc::new(Device::new(number, 100, DEFAULT_RESERVE_MS).unwrap());
+    let device = |number| Arc::new(Device::new(number, DEFAULT_LATENCY_MS).unwrap());
     let server = Arc::new(Server::new("127.0.0.1:0", vec![device(1), device(2)], Logger::discard()));
     let (ready_tx, ready) = mpsc::channel();
     let running = Arc::clone(&server);
@@ -573,7 +757,7 @@ fn cables_are_added_and_removed_while_serving() {
 
 #[test]
 fn serve_lists_devices_and_shuts_down() {
-    let device = active_device(100);
+    let device = active_device(DEFAULT_LATENCY_MS);
     let server = Arc::new(Server::new("127.0.0.1:0", vec![device], Logger::discard()));
     let (ready_tx, ready) = mpsc::channel();
     let running = Arc::clone(&server);

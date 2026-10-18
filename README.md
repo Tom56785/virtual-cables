@@ -11,7 +11,7 @@ The USB/IP transport is provided by [usbip-win2](https://github.com/vadimgrn/usb
 - Standard USB Audio Class 1.0 devices, handled by Windows' built-in USB audio driver
 - No emulation of proprietary audio hardware
 - Add or remove cables from the application
-- An independent audio buffer for every cable
+- Bit-exact pass-through with a fixed latency on every cable
 - A simple native Windows interface
 
 ## How it works
@@ -21,7 +21,7 @@ The application runs a local USB/IP server that exports each cable as a USB audi
 1. `Virtual Cable XX` playback device
 2. `Virtual Cable XX` recording device
 
-Audio written to the playback side is stored in a ring buffer and returned through the recording side of the same cable. The server paces both sides on the same USB frame clock that Windows uses, and a small elastic reserve absorbs scheduling jitter.
+Audio played to the playback side comes out of the recording side of the same cable, bit for bit, a fixed `latency_ms` later. Both sides run on the same 1 ms USB frame clock that Windows uses, so there is no clock drift to correct: each millisecond of playback audio is stored under its frame number, and the recording side returns the audio of the frame `latency_ms` earlier. If audio for a frame never arrives, only that frame is silent. Volume and mute on either side apply on the way through, and at 100% the audio is untouched.
 
 This is different from conventional virtual audio cables, which depend on a dedicated kernel-mode audio driver.
 
@@ -60,12 +60,17 @@ Settings are read from `config.toml` in the settings folder, `%LOCALAPPDATA%\Vir
 ```toml
 # Address of the local USB/IP server.
 listen = "127.0.0.1:3240"
-# Ring-buffer capacity per cable, 20-2000 ms.
-buffer_ms = 250
-# Audio kept buffered against scheduling hiccups, from 10 ms to half of buffer_ms.
-reserve_ms = 40
+# Delay between each cable's playback and recording sides, 1-1000 ms.
+# Playback that Windows sends later than this plays after a short gap.
+latency_ms = 40
+# When playback transfers complete: "start" of their first frame, which gives
+# Windows time to send the next one, or "end" of their last, as USB hardware does.
+playback_completion = "start"
 # Detailed USB/IP traces in the log, for troubleshooting.
 diagnostics = false
+# For troubleshooting: hold all audio transfers this many milliseconds once a
+# minute, to reproduce a system stall. 0 turns it off.
+stall_test_ms = 0
 
 [[cable]]
 id = 1
@@ -76,9 +81,10 @@ name = "Game audio"
 | Setting | Meaning | Default |
 |---|---|---|
 | `listen` | Address of the local USB/IP server. | `"127.0.0.1:3240"` |
-| `buffer_ms` | Ring-buffer capacity per cable, 20-2000 ms. Only matters when audio backs up, for example after a system stall. | `250` |
-| `reserve_ms` | Audio kept buffered against scheduling hiccups, from 10 ms to half of `buffer_ms`. This is the latency a cable adds: lower is more responsive, higher is more tolerant of system load. If the recording side runs out of audio twice within 10 seconds, the cable grows its reserve by half, up to half of `buffer_ms`, and steps it back after every 2 minutes without a dropout. | `40` |
+| `latency_ms` | Delay between each cable's playback and recording sides, 1-1000 ms. Windows sends playback about 10 ms ahead, so any value works while streaming normally; the latency is how late, after a system stall, playback can still arrive and play on time. If it arrives later still, the cable moves the rest of that stream later, leaving a short gap, and moves it back, skipping the audio in between, once Windows catches up. | `40` |
+| `playback_completion` | When playback transfers are reported complete: `"start"` of their first frame, or `"end"` of their last, as USB hardware does. Windows sends each playback transfer about 1 ms after an earlier one completes, keeping one to three queued, and resets the stream whenever a completion leaves nothing queued. `"start"` gives it a transfer's length more to send the next, but only while another transfer is queued behind: one with nothing behind it completes at its end, so a lone transfer never leaves the queue empty early. The audio plays at the same time either way. | `"start"` |
 | `diagnostics` | Detailed USB/IP traces in the log, for troubleshooting (`true` or `false`). | `false` |
+| `stall_test_ms` | For troubleshooting: hold every audio transfer of every cable this many milliseconds once a minute, starting a minute after start-up, to reproduce a system stall on demand. 0-10000; 0 turns it off. | `0` |
 | `[[cable]]` | One table per cable, up to 32, in list order. `serial` is created with the cable and is its identity in Windows, so a new cable is always a new device there with its own name, and an existing one keeps its settings after a restart. `id` (1-255) sets the USB product ID (`FFFF:CAxx`) and bus ID (`1-<id>`). `name` is what Windows Sound shows. The application rewrites these tables when cables are added or removed, and removing a cable also deletes its devices from Windows. | none |
 
 Invalid values fall back to the default, and the log says so. The application only ever rewrites the `[[cable]]` tables, so comments and edits elsewhere in the file are kept. If the file is not valid TOML, the application starts with the default settings and no cables, logs the error, and does not overwrite the file until it is fixed.
@@ -88,7 +94,7 @@ Invalid values fall back to the default, and the log says so. The application on
 Every setting can also be given on the command line, which overrides `config.toml` for that run:
 
 ```
-VirtualCables.exe [--cables <COUNT>] [--listen <ADDRESS>] [--buffer-ms <BUFFER_MS>] [--reserve-ms <RESERVE_MS>] [--diagnostics [<BOOL>]]
+VirtualCables.exe [--cables <COUNT>] [--listen <ADDRESS>] [--latency-ms <MS>] [--playback-completion <WHEN>] [--diagnostics [<BOOL>]] [--stall-test-ms <MS>]
 ```
 
 | Option | Action |
@@ -104,7 +110,16 @@ The executable is a windowed application, so to see command-line output in a con
 
 The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at each start of the application, so it holds only the current session; check it before restarting after a problem.
 
-- **Crackling or dropouts:** look for `AUDIO HEALTH` lines. They are always logged, at most one every 10 seconds per cable, when something has changed: `underruns` (the recording side ran out of audio), `overruns` (the buffer was full and audio was discarded), `reserve_ms` (the reserve the cable has grown to), and `playback_resyncs`, `capture_resyncs` and `halt_clears` (stream restarts and resets by Windows). Underruns that keep rising while `reserve_ms` stays at its maximum mean the playback side is delivering less than real time, which a larger buffer cannot fix. For more detail, set `diagnostics = true`, restart, and reproduce the problem. Each logged `HALT CLEAR` is then preceded by `ISO TRACE ... before` lines for the last transfers on that endpoint and followed by `ISO TRACE ... after` lines for the next ones, with their bus frames and timing. Lines containing `underrun_bytes` that keep increasing mean the recording side is running out of audio; `HALT CLEAR` lines show Windows resetting a stream after a system stall. If dropouts happen during normal load, try a larger `reserve_ms`.
+- **Crackling or dropouts:** look for `AUDIO HEALTH` lines. They are always logged, at most one every 10 seconds per cable, when something has changed:
+  - `missing_ms`: milliseconds of silence the recording side produced while playback was running.
+  - `realigned`: how often playback arrived too late to play on time, so its stream was moved later.
+  - `caught_up`: how often a stream that had been moved later was moved back once Windows caught up.
+  - `playback_resyncs`, `capture_resyncs` and `halt_clears`: stream restarts, and stream resets by Windows.
+  - `loop_breaks`: how often the cable held back a playback transfer to get Windows out of a reset loop, at most once a second.
+
+  `halt_clears` rising by hundreds every 10 seconds means Windows is stuck resetting the playback stream after every transfer, which sounds robotic or crackly; make sure `playback_completion` is `"start"`. `stall_test_ms = 30` reproduces the stall that can start such a loop once a minute, so settings can be tried quickly. If `missing_ms` rises after stalls without a reset loop, try a larger `latency_ms`.
+
+  For more detail, set `diagnostics = true`, restart, and reproduce the problem. Each logged `HALT CLEAR` (Windows resetting a stream) is then preceded by `ISO TRACE ... before` lines for the last transfers on that endpoint, and followed by `ISO TRACE ... after` lines for the next ones, with their bus frames and timing.
 - **No devices in Windows Sound:** check that usbip-win2 is installed and that the administrator prompt was approved. The `usbip.exe` lines in the log show the attach steps and any errors.
 
 ## Building from source
@@ -144,14 +159,14 @@ Open the project folder in RustRover. Shared run configurations are in `.run/` a
 | `src/cli.rs` | Command-line options |
 | `src/config.rs` | `config.toml` |
 | `src/uac1.rs` | The USB Audio Class 1.0 device: descriptors and control requests |
-| `src/audio.rs` | The ring buffer and rate correction between playback and recording |
+| `src/audio.rs` | The delay line, addressed by USB frame, between playback and recording |
 | `src/usbip/` | The USB/IP protocol, the server, and the USB frame clock |
 | `src/platform/windows/` | The window, the administrator helper, `usbip.exe` attachment and the driver download |
 | `src/event.rs` | Precise, interruptible waits for frame timing |
 
 ## Project status
 
-Virtual Cables is an experimental project. Its USB descriptors, USB/IP protocol handling, audio buffers, control requests and stream scheduling are covered by automated tests.
+Virtual Cables is an experimental project. Its USB descriptors, USB/IP protocol handling, audio path, control requests and stream scheduling are covered by automated tests.
 
 Real-world stability depends on the Windows system, the USB/IP transport, system load and the number of cables in use at once. Test it before relying on it in critical production or live-performance settings.
 

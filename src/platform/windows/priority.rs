@@ -1,15 +1,18 @@
 //! Process scheduling for real-time audio streaming.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Media::timeBeginPeriod;
 use windows_sys::Win32::System::Threading::{
-    ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-    PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
+    ABOVE_NORMAL_PRIORITY_CLASS, AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentProcess,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+    SetPriorityClass,
 };
 
-use super::win::{last_error, system_proc};
+use super::win::{last_error, system_proc, wide};
 use crate::logf;
 use crate::logging::Logger;
 
@@ -71,6 +74,36 @@ pub fn raise_process_priority(logger: &Logger) {
         }
     }
     log_timer_resolution(logger);
+}
+
+/// A thread registered with the Multimedia Class Scheduler Service; the
+/// registration ends when this is dropped.
+pub struct AudioThread(HANDLE);
+
+/// Registers the current thread with the Multimedia Class Scheduler Service as
+/// a "Pro Audio" task, as audio applications and Windows' own audio engine do.
+/// Every URB's reply is on the path Windows needs before it can send the next
+/// playback URB, so a thread that ordinary load delays by about 10 ms leaves
+/// playback with nothing queued.
+pub fn enter_audio_thread(logger: &Logger) -> AudioThread {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    let task = wide("Pro Audio");
+    let mut index = 0u32;
+    // SAFETY: the task name is NUL-terminated UTF-16 and index is a valid u32.
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+    if handle.is_null() && !REPORTED.swap(true, Ordering::Relaxed) {
+        logf!(logger, "Could not register audio threads with the multimedia scheduler: {}", last_error());
+    }
+    AudioThread(handle)
+}
+
+impl Drop for AudioThread {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the handle came from AvSetMmThreadCharacteristicsW on this thread.
+            unsafe { AvRevertMmThreadCharacteristics(self.0) };
+        }
+    }
 }
 
 /// Records the system clock-interrupt period, which is the granularity of the

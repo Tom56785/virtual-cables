@@ -24,12 +24,13 @@ use clap::Parser;
 
 use crate::cli::Cli;
 use crate::config::{
-    Cable, Config, DEFAULT_BUFFER_MS, DEFAULT_LISTEN, MAX_CABLES, config_bool, config_cables, config_int,
-    config_string, ensure_config_file, load_config_content, numbered_cables, parse_config,
+    Cable, Config, DEFAULT_LISTEN, MAX_CABLES, config_bool, config_cables, config_int, config_string,
+    ensure_config_file, load_config_content, numbered_cables, parse_config,
 };
 use crate::logging::{AsyncWriter, Logger, flush_log, set_app_log_writer};
-use crate::uac1::{DEFAULT_RESERVE_MS, Device, MAX_BUFFER_MS, MIN_BUFFER_MS, MIN_RESERVE_MS, bus_id};
+use crate::uac1::{DEFAULT_LATENCY_MS, Device, MAX_LATENCY_MS, MIN_LATENCY_MS, bus_id};
 use crate::usbip::Server;
+use crate::usbip::server::PlaybackCompletion;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -37,8 +38,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppServer {
     inner: Mutex<AppInner>,
     address: String,
-    buffer_ms: i64,
-    reserve_ms: i64,
+    /// The delay between each cable's playback and recording sides.
+    latency_ms: i64,
+    playback_completion: PlaybackCompletion,
+    /// For troubleshooting: how long to hold all transfers once a minute.
+    stall_test: Option<Duration>,
     /// Enables the USB/IP stream traces in the log.
     diagnostics: bool,
     pub logger: Logger,
@@ -61,7 +65,7 @@ impl AppServer {
         let mut inner = self.lock();
         self.stop_locked(&mut inner);
 
-        let devices = match make_devices(cables, self.buffer_ms, self.reserve_ms) {
+        let devices = match make_devices(cables, self.latency_ms) {
             Ok(devices) => devices,
             Err(err) => {
                 self.set_error_locked(&mut inner, &err);
@@ -70,6 +74,8 @@ impl AppServer {
         };
         let mut server = Server::new(self.address.clone(), devices, self.logger.clone());
         server.diagnostics = self.diagnostics;
+        server.playback_completion = self.playback_completion;
+        server.stall_test = self.stall_test;
         let server = Arc::new(server);
         let (ready_tx, ready) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
@@ -115,7 +121,7 @@ impl AppServer {
         };
         let added: Vec<Cable> = cables.iter().filter(|c| !inner.cables.contains(c)).cloned().collect();
         let removed: Vec<Cable> = inner.cables.iter().filter(|c| !cables.contains(c)).cloned().collect();
-        let devices = make_devices(&added, self.buffer_ms, self.reserve_ms)?;
+        let devices = make_devices(&added, self.latency_ms)?;
         for cable in &removed {
             server.remove_device(&bus_id(cable.id));
         }
@@ -242,20 +248,7 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
         Config::default()
     });
     let cables = startup_cables(cli.cables, &config, logger);
-    let mut buffer_ms = cli.buffer_ms.unwrap_or_else(|| config_int(&config, "buffer_ms", DEFAULT_BUFFER_MS));
-    if !(MIN_BUFFER_MS..=MAX_BUFFER_MS).contains(&buffer_ms) {
-        logf!(logger, "Invalid buffer size {buffer_ms} ms; falling back to {DEFAULT_BUFFER_MS} ms");
-        buffer_ms = DEFAULT_BUFFER_MS;
-    }
-    let mut reserve_ms = cli.reserve_ms.unwrap_or_else(|| config_int(&config, "reserve_ms", DEFAULT_RESERVE_MS));
-    if reserve_ms < MIN_RESERVE_MS || reserve_ms > buffer_ms / 2 {
-        logf!(
-            logger,
-            "Invalid reserve {reserve_ms} ms (must be {MIN_RESERVE_MS} ms to half the {buffer_ms} ms buffer); falling back to {DEFAULT_RESERVE_MS} ms"
-        );
-        reserve_ms = DEFAULT_RESERVE_MS.min(buffer_ms / 2);
-    }
-    logf!(logger, "Audio buffer: {buffer_ms} ms capacity, {reserve_ms} ms reserve");
+    let (latency_ms, playback_completion, stall_test) = audio_settings(&cli, &config, logger);
     let diagnostics = cli.diagnostics.unwrap_or_else(|| config_bool(&config, "diagnostics", false));
     let listen = cli.listen.clone().unwrap_or_else(|| config_string(&config, "listen", DEFAULT_LISTEN));
     logf!(logger, "Diagnostic logging: {diagnostics}");
@@ -274,7 +267,7 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
     let dump = cli.dump_descriptors;
     // The diagnostics check one stand-in cable when none are configured.
     let checked = if cables.is_empty() && (self_test || dump) { numbered_cables(1) } else { cables.clone() };
-    let devices = match make_devices(&checked, buffer_ms, reserve_ms) {
+    let devices = match make_devices(&checked, latency_ms) {
         Ok(devices) => devices,
         Err(err) => {
             return fail(logger, log_path, "Could not create the virtual cable devices", &err, self_test || dump);
@@ -302,8 +295,9 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
     let manager = Arc::new(AppServer {
         inner: Mutex::new(AppInner { server: None, done: None, cables: cables.clone(), last_error: String::new() }),
         address: listen,
-        buffer_ms,
-        reserve_ms,
+        latency_ms,
+        playback_completion,
+        stall_test,
         diagnostics,
         logger: logger.clone(),
         log_path: log_path.to_string(),
@@ -331,6 +325,48 @@ fn fail(logger: &Logger, log_path: &str, title: &str, err: &str, console_only: b
     1
 }
 
+/// The longest stall the stall test may simulate; it repeats every minute.
+const MAX_STALL_TEST_MS: i64 = 10_000;
+
+/// The audio settings, from the command line, config.toml or the defaults,
+/// with invalid values replaced by the defaults and logged.
+fn audio_settings(cli: &Cli, config: &Config, logger: &Logger) -> (i64, PlaybackCompletion, Option<Duration>) {
+    let mut latency_ms = cli.latency_ms.unwrap_or_else(|| config_int(config, "latency_ms", DEFAULT_LATENCY_MS));
+    if !(MIN_LATENCY_MS..=MAX_LATENCY_MS).contains(&latency_ms) {
+        logf!(
+            logger,
+            "Invalid latency {latency_ms} ms (must be {MIN_LATENCY_MS}-{MAX_LATENCY_MS} ms); falling back to {DEFAULT_LATENCY_MS} ms"
+        );
+        latency_ms = DEFAULT_LATENCY_MS;
+    }
+
+    let playback_completion = cli.playback_completion.unwrap_or_else(|| {
+        let text = config_string(config, "playback_completion", PlaybackCompletion::default().name());
+        PlaybackCompletion::parse(&text).unwrap_or_else(|| {
+            let fallback = PlaybackCompletion::default().name();
+            logf!(logger, "Invalid playback_completion {text:?} (must be \"start\" or \"end\"); using \"{fallback}\"");
+            PlaybackCompletion::default()
+        })
+    });
+
+    let mut stall_test_ms = cli.stall_test_ms.unwrap_or_else(|| config_int(config, "stall_test_ms", 0));
+    if !(0..=MAX_STALL_TEST_MS).contains(&stall_test_ms) {
+        logf!(logger, "Invalid stall test {stall_test_ms} ms (must be 0-{MAX_STALL_TEST_MS} ms); turning it off");
+        stall_test_ms = 0;
+    }
+    let stall_test = (stall_test_ms > 0).then(|| Duration::from_millis(stall_test_ms as u64));
+
+    logf!(
+        logger,
+        "Audio: {latency_ms} ms latency; playback transfers complete at their {}",
+        playback_completion.name()
+    );
+    if stall_test.is_some() {
+        logf!(logger, "Stall test: holding audio transfers for {stall_test_ms} ms every minute");
+    }
+    (latency_ms, playback_completion, stall_test)
+}
+
 /// The cables to start with: cables 1 to N for --cables N, otherwise the
 /// [[cable]] tables of config.toml, which may be none.
 fn startup_cables(cli_count: Option<i64>, config: &Config, logger: &Logger) -> Vec<Cable> {
@@ -344,11 +380,11 @@ fn startup_cables(cli_count: Option<i64>, config: &Config, logger: &Logger) -> V
     }
 }
 
-pub fn make_devices(cables: &[Cable], latency: i64, reserve: i64) -> Result<Vec<Arc<Device>>, String> {
+pub fn make_devices(cables: &[Cable], latency_ms: i64) -> Result<Vec<Arc<Device>>, String> {
     cables
         .iter()
         .map(|cable| {
-            Device::named(cable.id, &cable.serial, &cable.name, latency, reserve)
+            Device::named(cable.id, &cable.serial, &cable.name, latency_ms)
                 .map(Arc::new)
                 .map_err(|err| format!("create cable {} ({}): {err}", cable.id, cable.name))
         })
@@ -356,6 +392,7 @@ pub fn make_devices(cables: &[Cable], latency: i64, reserve: i64) -> Result<Vec<
 }
 
 fn run_self_test(devices: &[Arc<Device>]) -> Result<(), String> {
+    use crate::audio::PACKET_BYTES;
     use crate::uac1::{REQUEST_SET_CONFIGURATION, REQUEST_SET_INTERFACE, SetupPacket};
     for dev in devices {
         dev.descriptors.validate().map_err(|err| format!("{}: {err}", dev.product()))?;
@@ -372,22 +409,20 @@ fn run_self_test(devices: &[Arc<Device>]) -> Result<(), String> {
                 return Err(format!("activate interface status {status}"));
             }
         }
-        let frame = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-        let target_frames = (dev.buffer.capacity() / 6 / 2).min(dev.reserve_frames());
-        let pcm: Vec<u8> = frame.iter().copied().cycle().take((target_frames + 49) * frame.len()).collect();
-        if dev.write_playback(&pcm) != pcm.len() {
-            return Err("PCM write failed".into());
+        // A playback packet must come out of the recording side unchanged,
+        // exactly the latency later.
+        let packet: Vec<u8> = (0..PACKET_BYTES).map(|i| (i * 7 + 1) as u8).collect();
+        let frame = 1_000_000;
+        let latency = dev.audio.delay();
+        dev.write_playback(frame, [packet.as_slice()]);
+        let mut early = vec![0u8; PACKET_BYTES];
+        dev.read_capture(frame + latency - 1, &mut early, [PACKET_BYTES]);
+        let mut out = vec![0u8; PACKET_BYTES];
+        dev.read_capture(frame + latency, &mut out, [PACKET_BYTES]);
+        if early.iter().any(|&b| b != 0) {
+            return Err("PCM loopback came out early".into());
         }
-        // Drain the 1 ms startup fade, then verify the stable loopback sample.
-        let mut warmup = vec![0u8; 48 * frame.len()];
-        if dev.read_capture(&mut warmup) != warmup.len() {
-            return Err("PCM warmup read failed".into());
-        }
-        let mut out = [0u8; 6];
-        if dev.read_capture(&mut out) != out.len() {
-            return Err("PCM capture read failed".into());
-        }
-        if out != frame {
+        if out != packet {
             return Err("PCM loopback mismatch".into());
         }
     }
@@ -570,7 +605,7 @@ mod tests {
 
     #[test]
     fn self_test_passes() {
-        let devices = make_devices(&numbered_cables(2), DEFAULT_BUFFER_MS, DEFAULT_RESERVE_MS).unwrap();
+        let devices = make_devices(&numbered_cables(2), DEFAULT_LATENCY_MS).unwrap();
         run_self_test(&devices).unwrap();
     }
 
@@ -595,8 +630,9 @@ mod tests {
         let manager = AppServer {
             inner: Mutex::new(AppInner { server: None, done: None, cables: Vec::new(), last_error: String::new() }),
             address: "127.0.0.1:0".into(),
-            buffer_ms: DEFAULT_BUFFER_MS,
-            reserve_ms: DEFAULT_RESERVE_MS,
+            latency_ms: DEFAULT_LATENCY_MS,
+            playback_completion: PlaybackCompletion::End,
+            stall_test: None,
             diagnostics: false,
             logger: Logger::discard(),
             log_path: String::new(),
@@ -621,7 +657,7 @@ mod tests {
     #[test]
     fn devices_take_cable_ids_and_names() {
         let cables = [Cable { id: 7, serial: "8F3A2C1D".into(), name: "Game".into() }];
-        let devices = make_devices(&cables, DEFAULT_BUFFER_MS, DEFAULT_RESERVE_MS).unwrap();
+        let devices = make_devices(&cables, DEFAULT_LATENCY_MS).unwrap();
         assert_eq!((devices[0].bus_id.as_str(), devices[0].product()), ("1-7", "Game"));
         assert_eq!(devices[0].descriptors.serial, "8F3A2C1D");
         // The product ID follows the cable ID.
