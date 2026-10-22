@@ -55,12 +55,29 @@ pub struct Cli {
     /// Broker authentication token (internal)
     #[arg(long, hide = true)]
     pub broker_token: Option<String>,
+
+    /// Run as the Windows service (started by Windows)
+    #[arg(long, hide = true)]
+    pub service: bool,
+
+    /// Install the Windows service with a copy of this config.toml (started by the application itself)
+    #[arg(long, hide = true, value_name = "CONFIG")]
+    pub install_service: Option<String>,
+
+    /// Stop and remove the Windows service (started by the application itself)
+    #[arg(long, hide = true)]
+    pub uninstall_service: bool,
 }
 
 impl Cli {
     /// Whether the options select a one-off task instead of the application.
     pub fn is_helper_mode(&self) -> bool {
-        self.attach_broker || self.self_test || self.dump_descriptors || self.version
+        self.attach_broker
+            || self.install_service.is_some()
+            || self.uninstall_service
+            || self.self_test
+            || self.dump_descriptors
+            || self.version
     }
 }
 
@@ -101,6 +118,16 @@ mod tests {
     }
 
     #[test]
+    fn service_arguments_parse() {
+        // The exact arguments the service and the installer copies run with.
+        assert!(parse(&["--service"]).unwrap().service);
+        let install = parse(&["--install-service", "C:\\Users\\me\\config.toml"]).unwrap();
+        assert_eq!(install.install_service.as_deref(), Some("C:\\Users\\me\\config.toml"));
+        assert!(parse(&["--uninstall-service"]).unwrap().uninstall_service);
+        assert!(parse(&["--install-service"]).is_err(), "the configuration to copy is required");
+    }
+
+    #[test]
     fn rejects_bad_input() {
         for args in [&["--cables", "x"][..], &["--bogus"], &["--cables"], &["--diagnostics=maybe"]] {
             let err = parse(args).unwrap_err();
@@ -122,7 +149,9 @@ mod tests {
         ] {
             assert!(help.contains(&expected), "help text lacks {expected:?}:\n{help}");
         }
-        assert!(!help.contains("broker"), "internal options must stay hidden");
+        for internal in ["broker", "service"] {
+            assert!(!help.contains(internal), "internal options must stay hidden: {internal}");
+        }
         Cli::command().debug_assert();
     }
 
@@ -130,7 +159,16 @@ mod tests {
     fn helper_modes() {
         assert!(!parse(&[]).unwrap().is_helper_mode());
         assert!(!parse(&["--cables", "2", "--diagnostics"]).unwrap().is_helper_mode());
-        for args in [&["--self-test"][..], &["--dump-descriptors"], &["--version"], &["-V"], &["--attach-broker"]] {
+        assert!(!parse(&["--service"]).unwrap().is_helper_mode(), "the service starts its own log");
+        for args in [
+            &["--self-test"][..],
+            &["--dump-descriptors"],
+            &["--version"],
+            &["-V"],
+            &["--attach-broker"],
+            &["--install-service", "config.toml"],
+            &["--uninstall-service"],
+        ] {
             assert!(parse(args).unwrap().is_helper_mode(), "{args:?}");
         }
     }

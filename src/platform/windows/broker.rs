@@ -1,6 +1,9 @@
-//! The one-time elevated broker: an administrator copy of the application that
-//! attaches and detaches the cables in Windows on request, so the user
-//! approves elevation once per session rather than on every change.
+//! Attaching the cables in Windows, which takes administrator rights. An
+//! elevated process (the Windows service, or the application run as
+//! administrator) runs usbip.exe itself. Otherwise the one-time elevated broker
+//! does: an administrator copy of the application that attaches and detaches
+//! the cables on request, so the user approves elevation once per session
+//! rather than on every change.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -13,8 +16,9 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use super::attach::{ServerTarget, find_usbip_executable, remove_cable_device, run_attach_helper};
-use super::gui::{Tone, cable_ids, clear_status, gui_logger, main_window, server_address, set_status};
-use super::win::wide;
+use super::control::{Tone, cable_ids, clear_status, logger, server_address, set_status};
+use super::gui::main_window;
+use super::win::{is_elevated, wide};
 use crate::config::{Cable, MAX_CABLE_ID, MAX_CABLES, is_valid_serial};
 use crate::logf;
 use crate::logging::Logger;
@@ -22,9 +26,72 @@ use crate::logging::Logger;
 const NO_BROKER: &str = "Not in Windows Sound \u{00b7} the administrator helper did not start";
 const LOST_BROKER: &str = "Windows Sound not updated \u{00b7} lost the administrator helper";
 
+/// How this process changes the cables in Windows.
+enum Link {
+    /// Through the elevated broker's connection.
+    Broker(TcpStream),
+    /// By running usbip.exe itself, being elevated.
+    Direct(ServerTarget),
+}
+
+/// A change to make in Windows.
+enum Request<'a> {
+    /// Attach exactly these cables; with `full`, attach every one again.
+    Sync(&'a [u32], bool),
+    /// Delete a removed cable's devices.
+    Forget(&'a Cable),
+    /// Detach every cable, as the server is about to stop.
+    Quit,
+}
+
+impl Link {
+    /// Another handle to the same link, to use without holding the broker lock.
+    fn handle(&self) -> Option<Link> {
+        match self {
+            Link::Broker(stream) => stream.try_clone().ok().map(Link::Broker),
+            Link::Direct(target) => Some(Link::Direct(target.clone())),
+        }
+    }
+
+    /// Makes one change in Windows and waits for it. The outer error means the
+    /// broker is lost; the inner one that the change failed.
+    fn request(&self, request: &Request, logger: &Logger) -> Result<Result<(), String>, String> {
+        let conn = match self {
+            Link::Direct(target) => {
+                return Ok(match request {
+                    Request::Sync(ids, full) => run_attach_helper(ids, *full, target, logger),
+                    Request::Forget(cable) => remove_cable_device(cable.id, &cable.serial, logger),
+                    Request::Quit => run_attach_helper(&[], false, target, logger),
+                });
+            }
+            Link::Broker(conn) => conn,
+        };
+        let line = match request {
+            Request::Sync(ids, full) => sync_request(ids, *full),
+            Request::Forget(cable) => forget_request(cable.id, &cable.serial),
+            Request::Quit => "QUIT\n".to_string(),
+        };
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(45)));
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(45)));
+        let reply = (&*conn).write_all(line.as_bytes()).map_err(|err| err.to_string()).and_then(|()| read_line(conn));
+        let _ = conn.set_read_timeout(None);
+        let _ = conn.set_write_timeout(None);
+        Ok(match reply?.trim() {
+            "OK" => Ok(()),
+            reply => Err(reply.to_string()),
+        })
+    }
+
+    fn close(&self) {
+        if let Link::Broker(conn) = self {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 struct Connection {
     id: u64,
-    stream: TcpStream,
+    link: Link,
     /// Whether a full synchronization has succeeded on this connection; until
     /// then, attachments may be left from an earlier run.
     synced: bool,
@@ -41,7 +108,7 @@ struct Broker {
 
 static BROKER: Mutex<Broker> =
     Mutex::new(Broker { conn: None, desired: Vec::new(), removed: Vec::new(), starting: false });
-/// Serializes synchronization requests on the broker connection.
+/// Serializes requests on the connection.
 static COMMAND: Mutex<()> = Mutex::new(());
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
@@ -51,6 +118,12 @@ fn broker() -> std::sync::MutexGuard<'static, Broker> {
 
 fn mark_broker_start_failed() {
     broker().starting = false;
+}
+
+fn connect(link: Link) {
+    let mut b = broker();
+    b.conn = Some(Connection { id: NEXT_CONNECTION.fetch_add(1, Ordering::SeqCst), link, synced: false });
+    b.starting = false;
 }
 
 fn new_broker_token() -> Result<String, String> {
@@ -78,11 +151,27 @@ pub fn start_cable_broker() {
         b.starting = true;
         b.desired = ids;
     }
-    let logger = gui_logger();
+    let logger = logger();
 
     if find_usbip_executable().is_none() {
         mark_broker_start_failed();
         set_status(Tone::Error, "Not in Windows Sound \u{00b7} install the driver from the Options menu");
+        return;
+    }
+
+    if is_elevated() {
+        match ServerTarget::from_listen(&server_address()) {
+            Ok(target) => {
+                logf!(logger, "Running elevated: attaching the cables without the administrator broker");
+                connect(Link::Direct(target));
+                std::thread::spawn(sync_cable_devices);
+            }
+            Err(err) => {
+                mark_broker_start_failed();
+                logf!(logger, "Could not attach the cables: {err}");
+                set_status(Tone::Error, "Not in Windows Sound \u{00b7} see the diagnostic log");
+            }
+        }
         return;
     }
 
@@ -148,7 +237,7 @@ pub fn start_cable_broker() {
 
 /// Waits up to 60 seconds for the elevated copy to connect and authenticate.
 fn accept_cable_broker(listener: TcpListener, token: String) {
-    let logger = gui_logger();
+    let logger = logger();
     let deadline = Instant::now() + Duration::from_secs(60);
     let _ = listener.set_nonblocking(true);
     let conn = loop {
@@ -184,11 +273,7 @@ fn accept_cable_broker(listener: TcpListener, token: String) {
         return;
     }
     let _ = conn.set_read_timeout(None);
-    {
-        let mut b = broker();
-        b.conn = Some(Connection { id: NEXT_CONNECTION.fetch_add(1, Ordering::SeqCst), stream: conn, synced: false });
-        b.starting = false;
-    }
+    connect(Link::Broker(conn));
     logf!(logger, "One-time administrator broker connected");
     sync_cable_devices();
 }
@@ -241,32 +326,24 @@ pub fn request_cable_sync() {
     }
 }
 
-/// Has the broker delete the Windows devices of each removed cable. A cable
-/// whose request cannot be sent stays queued for the next connection.
-fn forget_removed_cables(mut conn: &TcpStream, connection: u64, logger: &Logger) {
+/// Deletes the Windows devices of each removed cable. A cable whose request
+/// cannot be sent stays queued for the next connection.
+fn forget_removed_cables(link: &Link, connection: u64, logger: &Logger) {
     loop {
         let Some(cable) = broker().removed.first().cloned() else {
             return;
         };
-        let _ = conn.set_read_timeout(Some(Duration::from_secs(45)));
-        let _ = conn.set_write_timeout(Some(Duration::from_secs(45)));
-        let reply = conn
-            .write_all(forget_request(cable.id, &cable.serial).as_bytes())
-            .map_err(|err| err.to_string())
-            .and_then(|()| read_line(conn));
-        let _ = conn.set_read_timeout(None);
-        let _ = conn.set_write_timeout(None);
-        match reply {
-            Ok(reply) => {
+        match link.request(&Request::Forget(&cable), logger) {
+            Ok(result) => {
                 broker().removed.retain(|c| c != &cable);
-                match reply.trim() {
-                    "OK" => logf!(logger, "Removed the Windows devices of cable {} ({})", cable.id, cable.serial),
-                    reply => logf!(logger, "Could not remove the Windows devices of cable {}: {reply}", cable.id),
+                match result {
+                    Ok(()) => logf!(logger, "Removed the Windows devices of cable {} ({})", cable.id, cable.serial),
+                    Err(err) => logf!(logger, "Could not remove the Windows devices of cable {}: {err}", cable.id),
                 }
             }
             Err(err) => {
                 logf!(logger, "Administrator broker device removal failed: {err}");
-                let _ = conn.shutdown(std::net::Shutdown::Both);
+                link.close();
                 clear_broker_connection(connection);
                 return;
             }
@@ -283,48 +360,35 @@ pub fn forget_cable_devices(cable: &Cable) {
     }
 }
 
-/// Sends the broker the cables Windows should have. The list is read once
-/// this synchronization has the connection to itself, so whichever runs last
+/// Attaches the cables Windows should have. The list is read once this
+/// synchronization has the connection to itself, so whichever runs last
 /// applies the latest list, however the threads that asked for them are
 /// scheduled.
 fn sync_cable_devices() {
     let _command = COMMAND.lock().unwrap_or_else(|p| p.into_inner());
-    let logger = gui_logger();
+    let logger = logger();
     let connection = {
         let b = broker();
-        b.conn.as_ref().and_then(|c| Some((c.id, c.stream.try_clone().ok()?, !c.synced, b.desired.clone())))
+        b.conn.as_ref().and_then(|c| Some((c.id, c.link.handle()?, !c.synced, b.desired.clone())))
     };
-    let Some((id, conn, full, ids)) = connection else {
+    let Some((id, link, full, ids)) = connection else {
         return;
     };
     set_status(Tone::Pending, "Synchronizing with Windows Sound\u{2026}");
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(45)));
-    let _ = conn.set_write_timeout(Some(Duration::from_secs(45)));
-    if let Err(err) = (&conn).write_all(sync_request(&ids, full).as_bytes()) {
-        logf!(logger, "Could not send device synchronization request: {err}");
-        let _ = conn.shutdown(std::net::Shutdown::Both);
-        clear_broker_connection(id);
-        set_status(Tone::Error, LOST_BROKER);
-        return;
-    }
-    let reply = read_line(&conn);
-    let _ = conn.set_read_timeout(None);
-    let _ = conn.set_write_timeout(None);
-    let reply = match reply {
-        Ok(reply) => reply,
+    let result = match link.request(&Request::Sync(&ids, full), &logger) {
+        Ok(result) => result,
         Err(err) => {
-            logf!(logger, "Administrator broker reply failed: {err}");
-            let _ = conn.shutdown(std::net::Shutdown::Both);
+            logf!(logger, "Lost the administrator broker: {err}");
+            link.close();
             clear_broker_connection(id);
             set_status(Tone::Error, LOST_BROKER);
             return;
         }
     };
-    let reply = reply.trim();
     // Removed cables are detached now either way, so their devices can go.
-    forget_removed_cables(&conn, id, &logger);
-    if reply != "OK" {
-        logf!(logger, "Windows device synchronization failed: {reply}");
+    forget_removed_cables(&link, id, &logger);
+    if let Err(err) = result {
+        logf!(logger, "Windows device synchronization failed: {err}");
         set_status(Tone::Error, "Windows Sound synchronization failed \u{00b7} see the diagnostic log");
         return;
     }
@@ -346,12 +410,22 @@ fn clear_broker_connection(id: u64) {
     }
 }
 
+/// Takes the cables out of Windows, as the server is about to stop, so that
+/// usbip-win2 does not keep reconnecting them, and lets the elevated broker
+/// go. Returns once they are detached, so that another server can take over
+/// the port without its cables being detached.
 pub fn stop_cable_broker() {
-    let mut b = broker();
-    if let Some(conn) = b.conn.take() {
-        let _ = (&conn.stream).write_all(b"QUIT\n");
-        let _ = conn.stream.shutdown(std::net::Shutdown::Both);
+    let _command = COMMAND.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(conn) = broker().conn.take() else {
+        return;
+    };
+    let logger = logger();
+    match conn.link.request(&Request::Quit, &logger) {
+        Ok(Ok(())) => logf!(logger, "Detached the cables from Windows"),
+        Ok(Err(err)) => logf!(logger, "Could not detach the cables from Windows: {err}"),
+        Err(err) => logf!(logger, "The administrator broker did not confirm detaching the cables: {err}"),
     }
+    conn.link.close();
 }
 
 /// Runs in the elevated copy: connects back to the application and serves
@@ -365,26 +439,32 @@ pub fn run_attach_broker(address: &str, token: &str, listen: &str, logger: &Logg
     let conn = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(|err| format!("connect to main application: {err}"))?;
     (&conn).write_all(format!("{token}\n").as_bytes()).map_err(|err| err.to_string())?;
-    let result = serve_broker_requests(conn, &target, logger);
-    // Whether the application quit or was stopped, its server is gone. Take its
-    // cables out of Windows, so usbip-win2 does not keep trying to reconnect
-    // them until the next start.
+    let quit = serve_broker_requests(&conn, &target, logger);
+    // Whether the application quit or was stopped, its server is gone or about
+    // to go. Take its cables out of Windows, so usbip-win2 does not keep trying
+    // to reconnect them until the next start.
     logf!(logger, "Main application closed; detaching its cables from Windows");
-    if let Err(err) = run_attach_helper(&[], false, &target, logger) {
+    let detached = run_attach_helper(&[], false, &target, logger);
+    if let Err(err) = &detached {
         logf!(logger, "Could not detach the cables: {err}");
     }
-    result
+    if quit == Ok(true) {
+        // The application waits for this before it lets the port go.
+        let reply = if detached.is_ok() { "OK\n" } else { "ERR detach failed\n" };
+        let _ = (&conn).write_all(reply.as_bytes());
+    }
+    quit.map(|_| ())
 }
 
-/// Serves requests until QUIT, or until the application closes the connection
-/// or is stopped.
-fn serve_broker_requests(conn: TcpStream, target: &ServerTarget, logger: &Logger) -> Result<(), String> {
-    let mut writer = conn.try_clone().map_err(|err| err.to_string())?;
+/// Serves requests until QUIT, which returns true, or until the application
+/// closes the connection or is stopped.
+fn serve_broker_requests(conn: &TcpStream, target: &ServerTarget, logger: &Logger) -> Result<bool, String> {
+    let mut writer = conn;
     for line in BufReader::new(conn).lines() {
         let line = line.map_err(|err| err.to_string())?;
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields == ["QUIT"] {
-            return Ok(());
+            return Ok(true);
         }
         let reply = match fields.as_slice() {
             [verb @ ("SYNC" | "RESYNC"), ids @ ..] => match parse_sync_ids(ids) {
@@ -411,7 +491,7 @@ fn serve_broker_requests(conn: TcpStream, target: &ServerTarget, logger: &Logger
         };
         let _ = writer.write_all(format!("{reply}\n").as_bytes());
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The request that makes the broker attach exactly these cables: RESYNC
@@ -510,7 +590,7 @@ mod tests {
         let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (served, _) = listener.accept().unwrap();
         let target = ServerTarget::from_listen(LISTEN).unwrap();
-        let broker = std::thread::spawn(move || serve_broker_requests(served, &target, &Logger::discard()));
+        let broker = std::thread::spawn(move || serve_broker_requests(&served, &target, &Logger::discard()));
         (&conn).write_all(b"HELLO\nSYNC 2 2\nSYNC 256\nSYNC x\n").unwrap();
         assert_eq!(read_line(&conn).unwrap(), "ERR invalid request");
         for _ in 0..3 {
@@ -521,6 +601,6 @@ mod tests {
         assert_eq!(read_line(&conn).unwrap(), "ERR invalid cable");
         assert_eq!(read_line(&conn).unwrap(), "ERR invalid request");
         (&conn).write_all(b"QUIT\n").unwrap();
-        assert_eq!(broker.join().unwrap(), Ok(()));
+        assert_eq!(broker.join().unwrap(), Ok(true));
     }
 }

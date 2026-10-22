@@ -1,12 +1,15 @@
-//! The native Win32 window: the header with the server and Windows Sound
-//! status and the Options menu, the cable list and add/remove buttons.
+//! The native Win32 window: the header with the server, where the cables run
+//! and the Windows Sound status, and the Options menu, the cable list and
+//! add/remove buttons. The cables run in this process (on demand) or in the
+//! Windows service, which the window then manages through its pipe.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -33,13 +36,17 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use super::attach::{combined_output, hide_command_window, single_line};
-use super::broker::{forget_cable_devices, request_cable_sync, resync_cables, start_cable_broker, stop_cable_broker};
+use super::control::{self, Snapshot, Tone};
 use super::download::{download_latest_usbip_installer, is_name_resolution_error};
+use super::remote::{self, Reply, Request};
+use super::service::{ServiceState, run_elevated, service_state, start_service};
 use super::win::{system_proc, wide};
-use crate::AppServer;
-use crate::config::{Cable, MAX_CABLE_NAME, MAX_CABLES, application_data_dir, new_cable, save_cables};
+use crate::config::{
+    CONFIG_FILE, Cable, MAX_CABLE_NAME, MAX_CABLES, application_data_dir, config_cables, config_file_path,
+    load_config_content, new_cable, parse_config, service_data_dir,
+};
 use crate::logf;
-use crate::logging::Logger;
+use crate::{AppServer, VERSION};
 
 const ID_ADD: i32 = 1001;
 const ID_REMOVE: i32 = 1002;
@@ -48,13 +55,21 @@ const ID_DRIVER: i32 = 1005;
 const ID_SETTINGS: i32 = 1006;
 const ID_OPTIONS: i32 = 1007;
 const ID_SYNC: i32 = 1008;
+const ID_SERVICE: i32 = 1009;
+const ID_UNINSTALL: i32 = 1010;
+
+/// Posted from any thread when what the window shows may have changed.
+const WM_APP_REFRESH: u32 = WM_APP + 1;
+/// Posted to run the cables in this process; a non-zero WPARAM loads them
+/// from config.toml instead of keeping the ones it had.
+const WM_APP_RUN_ON_DEMAND: u32 = WM_APP + 2;
 
 const BS_PUSHBUTTON_STYLE: u32 = 0;
 
 // Layout, in 96-DPI pixels; `scale` converts them for the window's monitor.
 const MARGIN: i32 = 16;
 const GAP: i32 = 8;
-const HEADER_HEIGHT: i32 = 94;
+const HEADER_HEIGHT: i32 = 114;
 const BUTTON_HEIGHT: i32 = 30;
 const OPTIONS_Y: i32 = 12;
 const CABLE_BUTTONS_Y: i32 = 50;
@@ -74,7 +89,6 @@ const ERROR_COLOR: COLORREF = rgb(196, 43, 28);
 
 const USBIP_RELEASE_PAGE: &str = "https://github.com/vadimgrn/usbip-win2/releases/latest";
 
-static MANAGER: OnceLock<Arc<AppServer>> = OnceLock::new();
 static MAIN_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static ADD_BUTTON: AtomicIsize = AtomicIsize::new(0);
 static REMOVE_BUTTON: AtomicIsize = AtomicIsize::new(0);
@@ -84,30 +98,58 @@ static LIST_VIEW: AtomicIsize = AtomicIsize::new(0);
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
 static TITLE_FONT: AtomicIsize = AtomicIsize::new(0);
 static DPI: AtomicU32 = AtomicU32::new(96);
-/// The cables, in list order.
-static CABLES: Mutex<Vec<Cable>> = Mutex::new(Vec::new());
-/// The header's second status line: Windows Sound synchronization, or the
-/// progress of a driver installation.
-static STATUS: Mutex<Option<(Tone, String)>> = Mutex::new(None);
+/// The window's own message for the status line, such as the progress of a
+/// driver installation, with the Windows Sound status it covers: it shows
+/// until that status changes.
+static NOTICE: Mutex<Option<Notice>> = Mutex::new(None);
 /// Where the status line's Retry link was last painted, in client
 /// coordinates; None while there is no link.
 static RETRY_LINK: Mutex<Option<RECT>> = Mutex::new(None);
+/// The cables the list shows, and whether the server was running.
+static LISTED: Mutex<(Vec<Cable>, bool)> = Mutex::new((Vec::new(), true));
+static SERVICE: Mutex<ServiceView> = Mutex::new(ServiceView {
+    mode: Mode::OnDemand,
+    state: ServiceState::NotInstalled,
+    connected: false,
+    remote: Snapshot { cables: Vec::new(), server_error: String::new(), status: None },
+    version: String::new(),
+    busy: None,
+});
 
-/// How a status line reads at a glance, shown as the colour of its dot.
-#[derive(Clone, Copy)]
-pub enum Tone {
-    Ok,
-    Pending,
-    Error,
+struct Notice {
+    line: (Tone, String),
+    covers: Option<(Tone, String)>,
 }
 
-impl Tone {
-    fn color(self) -> COLORREF {
-        match self {
-            Tone::Ok => OK_COLOR,
-            Tone::Pending => PENDING_COLOR,
-            Tone::Error => ERROR_COLOR,
-        }
+/// Where the cables run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    /// In this process, until the window closes.
+    OnDemand,
+    /// In the Windows service, which this window manages.
+    Service,
+}
+
+/// What the window knows of the Windows service.
+#[derive(Clone, PartialEq)]
+struct ServiceView {
+    mode: Mode,
+    state: ServiceState,
+    /// Whether the service answered the last request.
+    connected: bool,
+    /// The service's cables and status, as last reported.
+    remote: Snapshot,
+    /// The service's version, as last reported.
+    version: String,
+    /// What the window is doing to the service, while it does it.
+    busy: Option<&'static str>,
+}
+
+fn tone_color(tone: Tone) -> COLORREF {
+    match tone {
+        Tone::Ok => OK_COLOR,
+        Tone::Pending => PENDING_COLOR,
+        Tone::Error => ERROR_COLOR,
     }
 }
 
@@ -125,32 +167,66 @@ pub fn main_window() -> HWND {
     handle(&MAIN_WINDOW)
 }
 
-fn cables() -> Vec<Cable> {
-    CABLES.lock().unwrap_or_else(|p| p.into_inner()).clone()
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The IDs of the cables Windows should have.
-pub fn cable_ids() -> Vec<u32> {
-    cables().iter().map(|c| c.id).collect()
+fn service_view() -> ServiceView {
+    lock(&SERVICE).clone()
 }
 
-fn manager() -> Option<&'static Arc<AppServer>> {
-    MANAGER.get()
+fn mode() -> Mode {
+    lock(&SERVICE).mode
 }
 
-/// The application log, for code running on behalf of the window.
-pub fn gui_logger() -> Logger {
-    manager().map_or_else(Logger::discard, |m| m.logger.clone())
+/// The server and cables the window shows, wherever they run.
+fn view() -> Snapshot {
+    let service = service_view();
+    match service.mode {
+        Mode::OnDemand => control::snapshot(),
+        Mode::Service if service.connected => service.remote,
+        Mode::Service => Snapshot { server_error: "the Windows service is not running".into(), ..service.remote },
+    }
 }
 
-/// The address the USB/IP server listens on.
-pub fn server_address() -> String {
-    manager().map(|m| m.address().to_string()).unwrap_or_else(|| crate::config::DEFAULT_LISTEN.to_string())
+/// Asks for a repaint from the latest state; safe from any thread.
+fn post_refresh() {
+    let window = main_window();
+    if !window.is_null() {
+        // SAFETY: posting to a window is safe from any thread.
+        unsafe { PostMessageW(window, WM_APP_REFRESH, 0, 0) };
+    }
+}
+
+/// Records a reply from the service.
+fn record_reply(reply: &Reply) {
+    let mut service = lock(&SERVICE);
+    service.connected = true;
+    service.remote = reply.snapshot.clone();
+    service.version = reply.version.clone();
+}
+
+fn set_busy(busy: Option<&'static str>) {
+    lock(&SERVICE).busy = busy;
+    post_refresh();
 }
 
 pub fn run_gui(manager: &Arc<AppServer>) {
-    let _ = MANAGER.set(Arc::clone(manager));
-    *CABLES.lock().unwrap_or_else(|p| p.into_inner()) = manager.cables();
+    control::init(manager);
+    control::on_change(post_refresh);
+    let logger = control::logger();
+    // A running service has the cables; otherwise this window runs them. One
+    // still starting, as at sign-in, is given the time to.
+    let service = call_service_within(if service_state() == ServiceState::Pending { 15 } else { 0 });
+    match &service {
+        Ok(reply) => {
+            record_reply(reply);
+            lock(&SERVICE).mode = Mode::Service;
+            logf!(logger, "Managing the Windows service, version {}", reply.version);
+        }
+        Err(_) => logf!(logger, "Running on demand"),
+    }
+    lock(&SERVICE).state = service_state();
 
     // SAFETY: Win32 window creation and the message loop on this thread; all
     // strings are NUL-terminated UTF-16 that outlive the calls.
@@ -220,15 +296,14 @@ pub fn run_gui(manager: &Arc<AppServer>) {
         ShowWindow(window, SW_SHOW);
         UpdateWindow(window);
         set_window_and_class_icons(window, icon_big, icon_small);
-        start_cable_broker();
-
-        let start_error = manager.last_error();
-        if !start_error.is_empty() {
-            show_error(&format!(
-                "The Virtual Cables window is now staying open, but the USB/IP server could not start:\n\n{start_error}\n\nDiagnostic log:\n{}",
-                manager.log_path()
-            ));
+        if mode() == Mode::OnDemand {
+            if service_view().state == ServiceState::Stopped && ask_to_start_service() {
+                run_switch("Starting the Windows service\u{2026}", || switch_to_service(false));
+            } else {
+                run_on_demand(manager.cables());
+            }
         }
+        std::thread::Builder::new().name("service monitor".into()).spawn(monitor_service).ok();
 
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
@@ -238,17 +313,42 @@ pub fn run_gui(manager: &Arc<AppServer>) {
     }
 }
 
-/// The Options button's dropdown: the settings folder and the driver
-/// installer.
+/// The Options button's dropdown: synchronization, the Windows service, the
+/// settings folder and the driver installer.
 unsafe fn create_options_menu() -> HMENU {
     // SAFETY: menu creation with NUL-terminated strings that outlive each call.
     unsafe {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, ID_SYNC as usize, wide("S&ync with Windows Sound").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        // update_options_menu names this item for the service's state.
+        AppendMenuW(menu, MF_STRING, ID_SERVICE as usize, wide("&Install as Windows service").as_ptr());
+        AppendMenuW(menu, MF_STRING, ID_UNINSTALL as usize, wide("&Uninstall Windows service").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, ID_SETTINGS as usize, wide("Open &settings folder").as_ptr());
         AppendMenuW(menu, MF_STRING, ID_DRIVER as usize, wide("&Download and install driver").as_ptr());
         menu
+    }
+}
+
+/// Names and enables the menu items for the cables' and the service's state.
+fn update_options_menu(menu: HMENU) {
+    let service = service_view();
+    let idle = service.busy.is_none();
+    let state = |enabled: bool| if enabled { MF_ENABLED } else { MF_GRAYED };
+    let (text, enabled) = match service.state {
+        ServiceState::NotInstalled => ("&Install as Windows service", idle),
+        ServiceState::Stopped => ("S&tart Windows service", idle),
+        ServiceState::Pending | ServiceState::Running => ("S&tart Windows service", false),
+    };
+    let reachable = service.mode == Mode::OnDemand || service.connected;
+    // SAFETY: menu calls on the Options menu with a NUL-terminated string.
+    unsafe {
+        let flags = MF_BYCOMMAND | MF_STRING | state(enabled);
+        ModifyMenuW(menu, ID_SERVICE as u32, flags, ID_SERVICE as usize, wide(text).as_ptr());
+        let installed = service.state != ServiceState::NotInstalled;
+        EnableMenuItem(menu, ID_UNINSTALL as u32, MF_BYCOMMAND | state(idle && installed));
+        EnableMenuItem(menu, ID_SYNC as u32, MF_BYCOMMAND | state(idle && reachable));
     }
 }
 
@@ -260,6 +360,7 @@ unsafe fn show_options_menu(window: HWND) {
         let mut button: RECT = std::mem::zeroed();
         GetWindowRect(handle(&OPTIONS_BUTTON), &mut button);
         let menu = OPTIONS_MENU.load(Ordering::SeqCst) as HMENU;
+        update_options_menu(menu);
         TrackPopupMenu(menu, TPM_RIGHTALIGN | TPM_TOPALIGN, button.right, button.bottom, 0, window, null());
     }
 }
@@ -423,8 +524,33 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
                     sync_now();
                     return 0;
                 }
+                ID_SERVICE => {
+                    match service_view().state {
+                        ServiceState::NotInstalled => install_service_from_gui(),
+                        ServiceState::Stopped => start_service_from_gui(),
+                        ServiceState::Pending | ServiceState::Running => {}
+                    }
+                    return 0;
+                }
+                ID_UNINSTALL => {
+                    uninstall_service_from_gui();
+                    return 0;
+                }
                 _ => {}
             },
+            WM_APP_REFRESH => {
+                refresh();
+                return 0;
+            }
+            WM_APP_RUN_ON_DEMAND => {
+                let cables = if wparam != 0 {
+                    config_cables(&parse_config(&load_config_content()).unwrap_or_default())
+                } else {
+                    control::snapshot().cables
+                };
+                run_on_demand(cables);
+                return 0;
+            }
             WM_LBUTTONUP => {
                 let (x, y) = ((lparam & 0xffff) as i16 as i32, ((lparam >> 16) & 0xffff) as i16 as i32);
                 if on_retry_link(x, y) {
@@ -449,9 +575,9 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
                 }
             }
             WM_DESTROY => {
-                stop_cable_broker();
-                if let Some(manager) = manager() {
-                    manager.stop();
+                // The service keeps its cables after the window closes.
+                if mode() == Mode::OnDemand {
+                    control::stop();
                 }
                 PostQuitMessage(0);
                 return 0;
@@ -691,12 +817,11 @@ fn invalidate_header() {
 }
 
 /// The USB/IP server's state and cable count, for the header.
-fn server_summary() -> (Tone, String) {
-    let last_error = manager().map(|m| m.last_error()).unwrap_or_default();
-    if !last_error.is_empty() {
+fn server_summary(view: &Snapshot) -> (Tone, String) {
+    if !view.server_error.is_empty() {
         return (Tone::Error, "USB/IP server error \u{00b7} see the diagnostic log in the settings folder".into());
     }
-    let count = cables().len();
+    let count = view.cables.len();
     let cables = match count {
         0 => "no cables yet".to_string(),
         1 => "1 cable".to_string(),
@@ -705,7 +830,54 @@ fn server_summary() -> (Tone, String) {
     (Tone::Ok, format!("USB/IP server running \u{00b7} {cables}"))
 }
 
-/// Paints the header band: the title, the server line and the status line.
+/// Where the cables run, for the header: in this window or in the service.
+fn mode_summary(service: &ServiceView) -> (Tone, String) {
+    if let Some(busy) = service.busy {
+        return (Tone::Pending, busy.to_string());
+    }
+    let text = match (service.mode, service.state) {
+        (Mode::Service, _) if service.connected && service.version != VERSION => {
+            format!("Running as a Windows service \u{00b7} the service is version {}", service.version)
+        }
+        (Mode::Service, _) if service.connected => {
+            "Running as a Windows service \u{00b7} the cables stay after this window closes".into()
+        }
+        (Mode::Service, ServiceState::Running) => {
+            return (
+                Tone::Error,
+                "The Windows service is not answering \u{00b7} see its log in the settings folder".into(),
+            );
+        }
+        (Mode::Service, _) => {
+            return (Tone::Error, "The Windows service is not running \u{00b7} start it from the Options menu".into());
+        }
+        (Mode::OnDemand, ServiceState::NotInstalled) => {
+            "Running on demand \u{00b7} the cables stop when this window closes".into()
+        }
+        (Mode::OnDemand, ServiceState::Running) => {
+            return (
+                Tone::Error,
+                "Running on demand, but the Windows service runs too \u{00b7} restart Virtual Cables".into(),
+            );
+        }
+        (Mode::OnDemand, _) => "Running on demand \u{00b7} the Windows service is installed but not running".into(),
+    };
+    (Tone::Ok, text)
+}
+
+/// The status line: the window's own notice, until the Windows Sound status it
+/// covers changes, then that status.
+fn status_line(view: &Snapshot) -> Option<(Tone, String)> {
+    let mut notice = lock(&NOTICE);
+    match notice.as_ref() {
+        Some(n) if n.covers == view.status => return Some(n.line.clone()),
+        Some(_) => *notice = None,
+        None => {}
+    }
+    view.status.clone()
+}
+
+/// Paints the header band: the title, the server, mode and status lines.
 unsafe fn paint(window: HWND) {
     // SAFETY: painting between BeginPaint and EndPaint with stock brushes and
     // this module's fonts; the original font is restored before EndPaint.
@@ -728,17 +900,19 @@ unsafe fn paint(window: HWND) {
         draw_text(dc, "Virtual Cables", title, format);
 
         SelectObject(dc, ui_font() as _);
-        let (tone, summary) = server_summary();
+        let view = view();
+        let (tone, summary) = server_summary(&view);
         let right = buttons.add - scale(2 * GAP);
         let line = RECT { left: scale(MARGIN), top: scale(42), right, bottom: scale(62) };
         draw_status_line(dc, line, tone, &summary, None);
+        let (tone, mode) = mode_summary(&service_view());
+        draw_status_line(dc, RECT { top: scale(62), bottom: scale(82), ..line }, tone, &mode, None);
         // A failed status line offers a retry.
-        let status = STATUS.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let retry = status.and_then(|(tone, text)| {
+        let retry = status_line(&view).and_then(|(tone, text)| {
             let link = matches!(tone, Tone::Error).then_some("Retry");
-            draw_status_line(dc, RECT { top: scale(62), bottom: scale(82), ..line }, tone, &text, link)
+            draw_status_line(dc, RECT { top: scale(82), bottom: scale(102), ..line }, tone, &text, link)
         });
-        *RETRY_LINK.lock().unwrap_or_else(|p| p.into_inner()) = retry;
+        *lock(&RETRY_LINK) = retry;
 
         SelectObject(dc, old_font);
         EndPaint(window, &paint);
@@ -751,7 +925,7 @@ unsafe fn draw_status_line(dc: HDC, line: RECT, tone: Tone, text: &str, link: Op
     let format = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
     // SAFETY: text measurement and drawing into a valid DC.
     unsafe {
-        SetTextColor(dc, tone.color());
+        SetTextColor(dc, tone_color(tone));
         draw_text(dc, "\u{25cf}", line, format);
         let text_left = line.left + text_width(dc, "\u{25cf}") + scale(6);
         let mut text_rect = RECT { left: text_left, ..line };
@@ -803,12 +977,28 @@ unsafe fn set_item_text(list: HWND, item: i32, sub_item: i32, text: &str) {
     }
 }
 
+/// Brings the window up to date: the list if the cables or the server
+/// changed, keeping the selected cable selected, and the header.
+fn refresh() {
+    let view = view();
+    let listed = lock(&LISTED).clone();
+    if listed == (view.cables.clone(), view.server_error.is_empty()) {
+        update_cable_buttons();
+        invalidate_header();
+        return;
+    }
+    let selected = selected_index().and_then(|i| listed.0.get(i)).map(|c| c.serial.clone());
+    refresh_list(selected.and_then(|serial| view.cables.iter().position(|c| c.serial == serial)));
+}
+
 /// Refills the list from the cables, selecting row `select` if given.
 fn refresh_list(select: Option<usize>) {
     let list = handle(&LIST_VIEW);
-    let last_error = manager().map(|m| m.last_error()).unwrap_or_default();
-    let row_status = if last_error.is_empty() { "Ready" } else { "Server error \u{2013} open the log" };
-    let cables = cables();
+    let view = view();
+    let running = view.server_error.is_empty();
+    let row_status = if running { "Ready" } else { "Server error \u{2013} open the log" };
+    let cables = view.cables;
+    *lock(&LISTED) = (cables.clone(), running);
     // SAFETY: ListView messages to a valid control with structs and strings
     // that outlive each call.
     unsafe {
@@ -838,18 +1028,43 @@ fn selected_index() -> Option<usize> {
     usize::try_from(index).ok()
 }
 
-/// Add needs room for another cable; Remove needs a selected cable.
+/// Add needs room for another cable; Remove needs a selected cable. Both need
+/// the cables' server to be reachable, and not to be handed over.
 fn update_cable_buttons() {
-    let count = cables().len();
+    let count = lock(&LISTED).0.len();
+    let service = service_view();
+    let usable = service.busy.is_none() && (service.mode == Mode::OnDemand || service.connected);
     // SAFETY: EnableWindow on valid control handles.
     unsafe {
-        EnableWindow(handle(&ADD_BUTTON), (count < MAX_CABLES) as i32);
-        EnableWindow(handle(&REMOVE_BUTTON), selected_index().is_some() as i32);
+        EnableWindow(handle(&ADD_BUTTON), (usable && count < MAX_CABLES) as i32);
+        EnableWindow(handle(&REMOVE_BUTTON), (usable && selected_index().is_some()) as i32);
+    }
+}
+
+/// Changes the cables wherever they run: in this process, or in the service.
+fn change(request: Request) -> Result<(), String> {
+    if mode() == Mode::OnDemand {
+        return match request {
+            Request::Status => Ok(()),
+            Request::Add(name) => control::add_cable(name),
+            Request::Remove(serial) => control::remove_cable(serial),
+            Request::Sync => control::sync_now(),
+        };
+    }
+    match remote::call(&request) {
+        Ok(reply) => {
+            record_reply(&reply);
+            reply.result
+        }
+        Err(err) => {
+            lock(&SERVICE).connected = false;
+            Err(format!("Could not reach the Windows service:\n{err}"))
+        }
     }
 }
 
 fn add_cable() {
-    let cables = cables();
+    let cables = view().cables;
     if cables.len() >= MAX_CABLES {
         show_error(&format!("A maximum of {MAX_CABLES} virtual cables is supported."));
         return;
@@ -857,14 +1072,17 @@ fn add_cable() {
     let Some(cable) = prompt_new_cable(&cables) else {
         return;
     };
-    let mut updated = cables;
-    updated.push(cable);
-    let select = updated.len() - 1;
-    apply_cables(updated, Some(select), None);
+    let result = change(Request::Add(&cable.name));
+    if let Err(err) = &result {
+        show_error(err);
+    }
+    // Select the new cable, which comes last.
+    let select = view().cables.iter().position(|c| c.name == cable.name);
+    refresh_list(if result.is_ok() { select } else { selected_index() });
 }
 
 fn remove_cable() {
-    let cables = cables();
+    let cables = view().cables;
     let Some(index) = selected_index().filter(|&i| i < cables.len()) else {
         show_error("Select the cable to remove.");
         return;
@@ -876,54 +1094,205 @@ fn remove_cable() {
     if !confirm("Remove cable", &question) {
         return;
     }
-    let mut updated = cables;
-    let removed = updated.remove(index);
+    if let Err(err) = change(Request::Remove(&cables[index].serial)) {
+        show_error(&err);
+    }
     // Select the cable that moved into its place, or the new last one.
-    let select = updated.len().checked_sub(1).map(|last| index.min(last));
-    apply_cables(updated, select, Some(removed));
-}
-
-/// Applies `updated` to the running server, saves it and brings Windows in
-/// line, deleting the Windows devices of the `removed` cable. Cables that did
-/// not change keep streaming.
-fn apply_cables(updated: Vec<Cable>, select: Option<usize>, removed: Option<Cable>) {
-    let Some(manager) = manager() else {
-        return;
-    };
-    if let Err(err) = manager.apply(&updated) {
-        show_error(&format!("Could not update the USB/IP server:\n{err}"));
-        return;
-    }
-    *CABLES.lock().unwrap_or_else(|p| p.into_inner()) = updated.clone();
-    if let Err(err) = save_cables(&updated) {
-        show_error(&format!("The cables were changed, but config could not be saved:\n{err}"));
-    }
+    let select = view().cables.len().checked_sub(1).map(|last| index.min(last));
     refresh_list(select);
-    if let Some(removed) = removed {
-        forget_cable_devices(&removed);
-    }
-    request_cable_sync();
 }
 
 /// Brings the server and Windows Sound back in line with the cables, for
 /// recovering from a failure: starts the USB/IP server if it is not running,
 /// then detaches and attaches every cable again.
 fn sync_now() {
-    if let Some(manager) = manager()
-        && let Err(err) = manager.apply(&cables())
-    {
-        show_error(&format!("Could not start the USB/IP server:\n{err}"));
+    if service_view().busy.is_some() {
+        return;
     }
-    refresh_list(selected_index());
-    resync_cables();
+    if let Err(err) = change(Request::Sync) {
+        show_error(&err);
+    }
+    refresh();
 }
 
 /// Whether the client point is on the status line's Retry link.
 fn on_retry_link(x: i32, y: i32) -> bool {
-    RETRY_LINK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_some_and(|r| (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y))
+    lock(&RETRY_LINK).is_some_and(|r| (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y))
+}
+
+/// Runs the cables in this process, as when no service runs them.
+fn run_on_demand(cables: Vec<Cable>) {
+    control::start(cables);
+    refresh_list(None);
+    let error = control::snapshot().server_error;
+    if !error.is_empty() {
+        // The window stays open, so the user can install the driver, inspect
+        // the status and open the diagnostic log.
+        show_error(&format!(
+            "The Virtual Cables window is now staying open, but the USB/IP server could not start:\n\n{error}\n\nDiagnostic log:\n{}",
+            control::log_path()
+        ));
+    }
+}
+
+/// Keeps the window up to date with the service: its state, and, while it has
+/// the cables, their state. Runs as long as the window is open.
+fn monitor_service() {
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let state = service_state();
+        let reply = (mode() == Mode::Service).then(|| remote::call(&Request::Status));
+        let before = service_view();
+        match reply {
+            Some(Ok(reply)) => record_reply(&reply),
+            Some(Err(_)) => lock(&SERVICE).connected = false,
+            None => {}
+        }
+        lock(&SERVICE).state = state;
+        if service_view() != before {
+            post_refresh();
+        }
+    }
+}
+
+/// Runs `job` on its own thread, showing `busy` meanwhile, and reports its
+/// failure.
+fn run_switch(busy: &'static str, job: fn() -> Result<(), String>) {
+    set_busy(Some(busy));
+    std::thread::spawn(move || {
+        let result = job();
+        lock(&SERVICE).state = service_state();
+        set_busy(None);
+        if let Err(err) = result {
+            logf!(control::logger(), "{}", single_line(&err));
+            show_error(&err);
+        }
+    });
+}
+
+/// Asks the service for its state, trying for up to `seconds` seconds.
+fn call_service_within(seconds: u64) -> Result<Reply, String> {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        match remote::call(&Request::Status) {
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            result => return result,
+        }
+    }
+}
+
+fn start_service_from_gui() {
+    if mode() == Mode::OnDemand {
+        let question = "Start the Virtual Cables Windows service?\n\n\
+            It takes over from this window with its own cables and settings, from when it was installed.";
+        if !confirm("Start Windows service", question) {
+            return;
+        }
+    }
+    run_switch("Starting the Windows service\u{2026}", || switch_to_service(mode() == Mode::OnDemand));
+}
+
+/// Asks, at startup, whether to start the installed service or run the cables
+/// in this window.
+fn ask_to_start_service() -> bool {
+    let question = "The Virtual Cables Windows service is installed but not running.\n\n\
+        Yes: start the service. It runs the cables with its own settings, and keeps them in Windows Sound \
+        after this window closes.\n\n\
+        No: run the cables in this window until it is closed.";
+    // SAFETY: a message box owned by the main window, with NUL-terminated strings.
+    unsafe {
+        MessageBoxW(
+            main_window(),
+            wide(question).as_ptr(),
+            wide("Start Windows service").as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
+fn install_service_from_gui() {
+    let question = "Install Virtual Cables as a Windows service?\n\n\
+        The service starts with Windows and keeps the cables in Windows Sound after this window closes, \
+        with no administrator prompt each time. It gets a copy of your cables and settings, and this \
+        window then manages it.";
+    if !confirm("Install Windows service", question) {
+        return;
+    }
+    run_switch("Installing the Windows service\u{2026}", || {
+        let parameters = format!("--install-service \"{}\"", config_file_path().display());
+        run_elevated(&parameters, main_window())
+            .map_err(|err| format!("Could not install the Windows service:\n{err}"))?;
+        switch_to_service(mode() == Mode::OnDemand)
+    });
+}
+
+/// Hands the cables over to the service: stops this window's server if
+/// `running_here`, which takes its cables out of Windows, and starts the
+/// service, which attaches its own. Runs the cables here if the service does
+/// not start: the ones it ran, or at startup the config's.
+fn switch_to_service(running_here: bool) -> Result<(), String> {
+    set_busy(Some("Starting the Windows service\u{2026}"));
+    let on_demand = mode() == Mode::OnDemand;
+    if running_here {
+        control::stop();
+    }
+    // The service opens its pipe before it reports that it runs.
+    let started = start_service()
+        .and_then(|()| call_service_within(10).map_err(|err| format!("the service does not answer: {err}")));
+    match started {
+        Ok(reply) => {
+            record_reply(&reply);
+            lock(&SERVICE).mode = Mode::Service;
+            logf!(control::logger(), "Managing the Windows service, version {}", reply.version);
+            Ok(())
+        }
+        Err(err) => {
+            if on_demand {
+                // SAFETY: posting to a window is safe from any thread.
+                unsafe { PostMessageW(main_window(), WM_APP_RUN_ON_DEMAND, usize::from(!running_here), 0) };
+            }
+            Err(format!("Could not start the Windows service:\n{err}"))
+        }
+    }
+}
+
+fn uninstall_service_from_gui() {
+    let question = if mode() == Mode::Service {
+        "Uninstall the Virtual Cables Windows service?\n\n\
+         Its cables leave Windows Sound. This window then runs them itself, with the service's cables and \
+         settings, until it is closed, and asks for administrator approval to add them to Windows Sound again."
+    } else {
+        "Uninstall the Virtual Cables Windows service?"
+    };
+    if !confirm("Uninstall Windows service", question) {
+        return;
+    }
+    run_switch("Uninstalling the Windows service\u{2026}", || {
+        run_elevated("--uninstall-service", main_window())
+            .map_err(|err| format!("Could not uninstall the Windows service:\n{err}"))?;
+        if mode() == Mode::Service {
+            take_back_service_config();
+            lock(&SERVICE).mode = Mode::OnDemand;
+            // SAFETY: posting to a window is safe from any thread.
+            unsafe { PostMessageW(main_window(), WM_APP_RUN_ON_DEMAND, 1, 0) };
+        }
+        Ok(())
+    });
+}
+
+/// Copies the service's settings and cables over this user's, so the window
+/// carries on with what the service had.
+fn take_back_service_config() {
+    let logger = control::logger();
+    let source = service_data_dir().join(CONFIG_FILE);
+    let copied = std::fs::read(&source).and_then(|content| {
+        std::fs::create_dir_all(application_data_dir())?;
+        std::fs::write(config_file_path(), content)
+    });
+    match copied {
+        Ok(()) => logf!(logger, "Copied the service's {} to {}", source.display(), config_file_path().display()),
+        Err(err) => logf!(logger, "Keeping this user's settings: could not copy {}: {err}", source.display()),
+    }
 }
 
 fn confirm(title: &str, question: &str) -> bool {
@@ -1153,10 +1522,10 @@ fn enable_driver_menu(enabled: bool) {
 
 fn download_and_install_driver() {
     enable_driver_menu(false);
-    set_status(Tone::Pending, "Driver: checking the official usbip-win2 release\u{2026}");
+    set_notice(Tone::Pending, "Driver: checking the official usbip-win2 release\u{2026}");
 
     std::thread::spawn(|| {
-        let logger = gui_logger();
+        let logger = control::logger();
         logf!(logger, "Driver installation requested from the GUI");
         let download = download_latest_usbip_installer(&driver_downloads_dir(), &driver_progress, &open_url, &|line| {
             logf!(logger, "{line}")
@@ -1166,7 +1535,7 @@ fn download_and_install_driver() {
             Err(err) => {
                 enable_driver_menu(true);
                 open_url(USBIP_RELEASE_PAGE);
-                set_status(
+                set_notice(
                     Tone::Error,
                     "Driver: automatic download failed \u{00b7} the official release page was opened",
                 );
@@ -1182,24 +1551,24 @@ fn download_and_install_driver() {
             }
         };
 
-        set_status(Tone::Pending, "Driver: verifying the installer signature\u{2026}");
+        set_notice(Tone::Pending, "Driver: verifying the installer signature\u{2026}");
         if let Err(signature_err) = verify_authenticode_signature(&asset_path) {
             logf!(logger, "Installer Authenticode warning; continuing with the official GitHub asset: {signature_err}");
             if let Err(folder_err) = reveal_downloaded_file(&asset_path) {
                 logf!(logger, "Could not reveal downloaded installer before launch: {folder_err}");
             }
-            set_status(
+            set_notice(
                 Tone::Pending,
                 "Driver: publisher signature not verified \u{00b7} starting the installer from the download folder\u{2026}",
             );
         } else {
-            set_status(Tone::Pending, "Driver: signature valid \u{00b7} starting the installer\u{2026}");
+            set_notice(Tone::Pending, "Driver: signature valid \u{00b7} starting the installer\u{2026}");
         }
 
         if let Err(err) = start_installer_elevated(&asset_path) {
             enable_driver_menu(true);
             let folder_result = reveal_downloaded_file(&asset_path);
-            set_status(
+            set_notice(
                 Tone::Error,
                 "Driver: the installer could not be started \u{00b7} its download folder was opened",
             );
@@ -1215,7 +1584,7 @@ fn download_and_install_driver() {
         }
 
         enable_driver_menu(true);
-        set_status(
+        set_notice(
             Tone::Ok,
             &format!("Driver: {asset_name} started \u{00b7} accept the administrator prompt and reboot if requested"),
         );
@@ -1241,7 +1610,7 @@ fn verify_authenticode_signature(path: &Path) -> Result<(), String> {
     command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script]);
     hide_command_window(&mut command);
     let (text, result) = combined_output(&mut command);
-    logf!(gui_logger(), "Installer Authenticode check: {}", single_line(&text));
+    logf!(control::logger(), "Installer Authenticode check: {}", single_line(&text));
     match result {
         Ok(()) => Ok(()),
         Err(err) => Err(format!("Authenticode status is not Valid: {}", if text.is_empty() { err } else { text })),
@@ -1351,9 +1720,10 @@ fn windows_downloads_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
-/// Opens the folder holding config and the log.
+/// Opens the folder holding config and the log: the service's while it runs
+/// the cables.
 fn open_settings_folder_from_gui() {
-    let directory = application_data_dir();
+    let directory = if mode() == Mode::Service { service_data_dir() } else { application_data_dir() };
     if let Err(err) = open_folder(&directory, "settings") {
         show_error(&format!("Could not open the settings folder:\n\n{}\n\n{err}", directory.display()));
     }
@@ -1386,15 +1756,10 @@ fn open_url(url: &str) {
     }
 }
 
-/// Sets the header's status line, below the server line; safe from any thread.
-pub fn set_status(tone: Tone, text: &str) {
-    *STATUS.lock().unwrap_or_else(|p| p.into_inner()) = Some((tone, text.to_string()));
-    invalidate_header();
-}
-
-/// Removes the header's status line; safe from any thread.
-pub fn clear_status() {
-    *STATUS.lock().unwrap_or_else(|p| p.into_inner()) = None;
+/// Shows the window's own message on the status line, in place of the
+/// Windows Sound status until that changes; safe from any thread.
+fn set_notice(tone: Tone, text: &str) {
+    *lock(&NOTICE) = Some(Notice { line: (tone, text.to_string()), covers: view().status });
     invalidate_header();
 }
 
@@ -1403,7 +1768,7 @@ fn driver_progress(text: &str) {
     let text = text.trim_end_matches('.');
     let mut chars = text.chars();
     let first = chars.next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
-    set_status(Tone::Pending, &format!("Driver: {first}{}\u{2026}", chars.as_str()));
+    set_notice(Tone::Pending, &format!("Driver: {first}{}\u{2026}", chars.as_str()));
 }
 
 pub fn show_fatal_dialog(message: &str) {

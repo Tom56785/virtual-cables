@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
@@ -27,8 +28,15 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// The key of the cable tables: one [[cable]] table per cable.
 const CABLE_KEY: &str = "cable";
 
-/// The per-user folder for the configuration and the log.
+/// The folder this process uses instead of the per-user one: the service's.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// The folder for the configuration and the log: the user's own, or the
+/// shared one in the Windows service.
 pub fn application_data_dir() -> PathBuf {
+    if let Some(dir) = DATA_DIR.get() {
+        return dir.clone();
+    }
     if let Ok(local) = env::var("LOCALAPPDATA")
         && !local.trim().is_empty()
     {
@@ -40,6 +48,19 @@ pub fn application_data_dir() -> PathBuf {
         return base.join("Virtual Cables");
     }
     env::temp_dir().join("Virtual Cables")
+}
+
+/// The Windows service's folder for its configuration and log, shared by every
+/// user: `%ProgramData%\Virtual Cables`.
+pub fn service_data_dir() -> PathBuf {
+    let base =
+        env::var("ProgramData").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| r"C:\ProgramData".into());
+    PathBuf::from(base).join("Virtual Cables")
+}
+
+/// Makes this process use the service's folder, as the service does.
+pub fn use_service_data_dir() {
+    let _ = DATA_DIR.set(service_data_dir());
 }
 
 /// The platform's per-user cache folder

@@ -15,7 +15,7 @@ mod usbip;
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -33,7 +33,7 @@ use crate::usbip::Server;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Runs and restarts the USB/IP server for the GUI.
+/// Runs and restarts the USB/IP server for the GUI or the Windows service.
 pub struct AppServer {
     inner: Mutex<AppInner>,
     address: String,
@@ -189,6 +189,12 @@ impl AppServer {
 
 fn main() {
     let parsed = Cli::try_parse_from(env::args_os());
+    // The service keeps its settings and log in a folder shared by every user,
+    // and has no desktop to show a dialog on.
+    let service = matches!(&parsed, Ok(cli) if cli.service);
+    if service {
+        config::use_service_data_dir();
+    }
     // Only a normal start clears the log. Helper runs (the administrator broker
     // in particular runs alongside the application), --help and command-line
     // errors append to it instead.
@@ -204,7 +210,9 @@ fn main() {
                 .unwrap_or_else(|| "unknown panic".into());
             let message = format!("Unexpected startup failure: {detail}");
             logf!(logger, "PANIC: {message}");
-            platform::show_fatal_dialog(&format!("{message}\n\nDiagnostic log:\n{log_path}"));
+            if !service {
+                platform::show_fatal_dialog(&format!("{message}\n\nDiagnostic log:\n{log_path}"));
+            }
             0
         }
     };
@@ -259,6 +267,19 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
         }
         return 0;
     }
+    // The application starts these elevated and reports a failure itself.
+    if let Some(config) = &cli.install_service {
+        return match platform::install_service(Path::new(config), logger) {
+            Ok(()) => 0,
+            Err(err) => fail(logger, log_path, "Could not install the Windows service", &err, true),
+        };
+    }
+    if cli.uninstall_service {
+        return match platform::uninstall_service(logger) {
+            Ok(()) => 0,
+            Err(err) => fail(logger, log_path, "Could not uninstall the Windows service", &err, true),
+        };
+    }
 
     let self_test = cli.self_test;
     let dump = cli.dump_descriptors;
@@ -298,11 +319,14 @@ fn run(logger: &Logger, log_path: &str, parsed: Result<Cli, clap::Error>) -> i32
         logger: logger.clone(),
         log_path: log_path.to_string(),
     });
-    if let Err(err) = manager.restart(&cables) {
-        // Do not close the GUI. The window remains available so the user can
-        // install the driver, inspect the status and open the diagnostic log.
-        logf!(logger, "Initial USB/IP server start failed; keeping GUI open: {err}");
+    if cli.service {
+        if let Err(err) = platform::run_service(&manager) {
+            return fail(logger, log_path, "Could not run the Windows service", &err, true);
+        }
+        logf!(logger, "Windows service stopped");
+        return 0;
     }
+    // The window starts the server, unless the Windows service runs it.
     platform::run_gui(&manager);
     logf!(logger, "Virtual Cables window closed normally");
     manager.stop();

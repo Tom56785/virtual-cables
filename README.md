@@ -12,6 +12,7 @@ The USB/IP transport is provided by [usbip-win2](https://github.com/vadimgrn/usb
 - No emulation of proprietary audio hardware
 - Add or remove cables from the application
 - Bit-exact pass-through with a fixed latency on every cable
+- Runs on demand from its window, or as a Windows service that keeps the cables available from start-up
 - A simple native Windows interface
 
 ## How it works
@@ -42,7 +43,7 @@ The USB Audio Class 2.0 descriptors declare one fixed 48 kHz clock and synchrono
 - Windows 10 version 1703 or later, or Windows 11, for the in-box USB Audio 2.0 driver
 - x64 processor
 - The usbip-win2 transport driver
-- Administrator approval when the cables are attached to Windows
+- Administrator approval when the cables are attached to Windows, or once to install the Windows service
 
 ## Getting started
 
@@ -55,9 +56,32 @@ To delete a cable, select it in the list and use **Remove cable**. Changes are s
 
 **Options > Open settings folder** opens the folder that holds `config.toml` and the log.
 
+## On demand or as a Windows service
+
+The header line under the USB/IP server status shows where the cables run.
+
+- **On demand** (the default): the window runs the cables itself. They leave Windows Sound when the window closes, and the administrator prompt comes back at each start.
+- **As a Windows service**: the service runs the cables from Windows start-up, whether or not the window is open, and attaches them without an administrator prompt. When the window opens and finds the service running, it only manages the service: adding and removing cables, synchronizing and the status all go to the service, and closing the window leaves the cables in place.
+
+**Options > Install as Windows service** asks for administrator approval once. The window then hands its cables over to the service:
+
+- The program is copied to `%ProgramFiles%\Virtual Cables`, since the service runs as LocalSystem.
+- Your `config.toml` is copied to the service's settings folder, `%ProgramData%\Virtual Cables`.
+- The window stops its own cables and starts the service.
+
+The service starts automatically with Windows, and Windows restarts it if it fails.
+
+If the service is installed but stopped when the window opens, the window asks whether to start the service or run the cables on demand. If the service does not start, the window runs them on demand. **Options > Start Windows service** starts an installed service that was stopped. **Options > Uninstall Windows service** asks for approval again, stops the service, which takes its cables out of Windows, and removes it. A window that was managing the service copies the service's `config.toml` back to your settings folder, then runs the cables on demand again.
+
+While the service runs the cables:
+
+- **Open settings folder** opens the service's folder, where its log is. Only administrators can edit its `config.toml`; restart the service after doing so.
+- The service keeps running the program it was installed from. After updating Virtual Cables, uninstall the service and install it again; until then the header shows the service's version.
+- Command-line settings given to the window do not apply to the service.
+
 ## Configuration
 
-Settings are read from `config.toml` in the settings folder, `%LOCALAPPDATA%\Virtual Cables`. The file is created with the defaults on first start, and the application adds a `[[cable]]` table for each cable you create:
+Settings are read from `config.toml` in the settings folder: `%LOCALAPPDATA%\Virtual Cables` on demand, or `%ProgramData%\Virtual Cables` for the Windows service. The file is created with the defaults on first start, and the application adds a `[[cable]]` table for each cable you create:
 
 ```toml
 # Address of the local USB/IP server.
@@ -106,7 +130,7 @@ The executable is a windowed application, so to see command-line output in a con
 
 ## Logs and troubleshooting
 
-The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at each start of the application, so it holds only the current session; check it before restarting after a problem.
+The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at each start of the application, or of the service for the service's log, so it holds only the current session; check it before restarting after a problem. While the service runs the cables, its log has the server, audio and attachment lines, and the window's own log holds only what the window did.
 
 - **Crackling or dropouts:** look for `AUDIO HEALTH` lines. They are always logged, at most one every 10 seconds per cable, when something has changed:
   - `missing_ms`: milliseconds of silence the recording side produced while playback was running.
@@ -118,6 +142,7 @@ The log is `VirtualCables_USBIP.log` in the settings folder. It is cleared at ea
 
   For more detail, set `diagnostics = true`, restart, and reproduce the problem. Each logged `HALT CLEAR` (Windows resetting a stream) is then preceded by `ISO TRACE ... before` lines for the last transfers on that endpoint, and followed by `ISO TRACE ... after` lines for the next ones, with their bus frames and timing.
 - **No devices in Windows Sound:** check that usbip-win2 is installed and that the administrator prompt was approved. The `usbip.exe` lines in the log show the attach steps and any errors.
+- **The Windows service does not start:** check its log in `%ProgramData%\Virtual Cables`. Another copy of Virtual Cables running on demand holds the USB/IP port, so close it first. The header says so when both run.
 
 ## Building from source
 
@@ -158,7 +183,7 @@ Open the project folder in RustRover. Shared run configurations are in `.run/` a
 | `src/uac2.rs` | The USB Audio Class 2.0 device: descriptors and control requests |
 | `src/audio.rs` | The delay line, addressed by USB frame, between playback and recording |
 | `src/usbip/` | The USB/IP protocol, the server, and the USB frame clock |
-| `src/platform/windows/` | The window, the administrator helper, `usbip.exe` attachment and the driver download |
+| `src/platform/windows/` | The window, the Windows service and its pipe, the cable state they share, the administrator helper, `usbip.exe` attachment and the driver download |
 | `src/event.rs` | Precise, interruptible waits for frame timing |
 
 ## Project status
@@ -169,7 +194,7 @@ Real-world stability depends on the Windows system, the USB/IP transport, system
 
 ## Privacy
 
-Virtual Cables processes audio locally. Audio stays in memory on the computer, and the USB/IP server listens only on the local machine by default. The only network access is the optional driver download from GitHub.
+Virtual Cables processes audio locally. Audio stays in memory on the computer, and the USB/IP server listens only on the local machine by default. The only network access is the optional driver download from GitHub. The Windows service's pipe accepts only local connections from users signed in at the computer.
 
 ## Third-party components
 

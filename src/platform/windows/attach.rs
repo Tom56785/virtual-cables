@@ -110,7 +110,7 @@ fn port_number(line: &str) -> Option<&str> {
 
 /// Where usbip.exe reaches this application's USB/IP server: the host and
 /// port of the LISTEN address, with a wildcard host replaced by loopback.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServerTarget {
     host: String,
     port: u16,
